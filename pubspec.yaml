@@ -11,6 +11,16 @@ dependencies:
     sdk: flutter
   openrig_core:
     path: ../openrig_core
+  path_provider: ^2.1.5
+  shared_preferences: ^2.5.5
+
+dev_dependencies:
+  flutter_lints: ^6.0.0
+  flutter_test:
+    sdk: flutter
+  integration_test:
+    sdk: flutter
+  test: ^1.30.0
 
 flutter:
   uses-material-design: true
