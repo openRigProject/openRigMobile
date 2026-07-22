@@ -32,6 +32,8 @@ String _modeCategory(String comment) {
 
 enum _SortColumn { frequency, dxCall, spotter, time }
 
+enum _SpotSource { cluster, pota, sota }
+
 class SpotsScreen extends StatefulWidget {
   final AppConnectionState appState;
   final void Function(QsoPreFill)? onLogQso;
@@ -49,6 +51,16 @@ class _SpotsScreenState extends State<SpotsScreen> {
   Timer? _expiryTimer;
   bool _connected = false;
   String? _error;
+
+  // POTA / SOTA
+  _SpotSource _source = _SpotSource.cluster;
+  List<PotaSpot> _potaSpots = [];
+  List<SotaSpot> _sotaSpots = [];
+  PotaClient? _potaClient;
+  SotaClient? _sotaClient;
+  Timer? _potaSotaTimer;
+  bool _potaLoading = false;
+  bool _sotaLoading = false;
 
   String _clusterHost = 'dxc.ve7cc.net';
   int _clusterPort = 23;
@@ -99,6 +111,9 @@ class _SpotsScreenState extends State<SpotsScreen> {
   @override
   void dispose() {
     _expiryTimer?.cancel();
+    _potaSotaTimer?.cancel();
+    _potaClient?.dispose();
+    _sotaClient?.dispose();
     _disconnect();
     super.dispose();
   }
@@ -213,6 +228,133 @@ class _SpotsScreenState extends State<SpotsScreen> {
     await _client?.disconnect();
     _client = null;
     if (mounted) setState(() => _connected = false);
+  }
+
+  Future<void> _fetchPota() async {
+    _potaClient ??= PotaClient();
+    setState(() => _potaLoading = true);
+    try {
+      final spots = await _potaClient!.fetchActivators();
+      if (mounted) setState(() { _potaSpots = spots; _potaLoading = false; });
+    } catch (e) {
+      if (mounted) setState(() => _potaLoading = false);
+    }
+  }
+
+  Future<void> _fetchSota() async {
+    _sotaClient ??= SotaClient();
+    setState(() => _sotaLoading = true);
+    try {
+      final spots = await _sotaClient!.fetchSpots();
+      if (mounted) setState(() { _sotaSpots = spots; _sotaLoading = false; });
+    } catch (e) {
+      if (mounted) setState(() => _sotaLoading = false);
+    }
+  }
+
+  void _startPotaSotaTimer() {
+    _potaSotaTimer?.cancel();
+    _potaSotaTimer = Timer.periodic(const Duration(minutes: 2), (_) {
+      if (_source == _SpotSource.pota) _fetchPota();
+      if (_source == _SpotSource.sota) _fetchSota();
+    });
+  }
+
+  void _onSourceChanged(_SpotSource source) {
+    setState(() => _source = source);
+    if (source == _SpotSource.pota) {
+      _fetchPota();
+      _startPotaSotaTimer();
+    } else if (source == _SpotSource.sota) {
+      _fetchSota();
+      _startPotaSotaTimer();
+    } else {
+      _potaSotaTimer?.cancel();
+      _potaSotaTimer = null;
+    }
+  }
+
+  void _showPotaSpotDetail(PotaSpot spot) {
+    showModalBottomSheet(
+      context: context,
+      builder: (ctx) => Padding(
+        padding: const EdgeInsets.all(20),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(spot.activator, style: const TextStyle(fontSize: 28, fontWeight: FontWeight.bold)),
+            const SizedBox(height: 8),
+            Text('${spot.reference} — ${spot.parkName}'),
+            const SizedBox(height: 4),
+            Text('${spot.frequencyKhz.toStringAsFixed(1)} kHz  ${spot.mode}'),
+            if (spot.comment.isNotEmpty)
+              Text(spot.comment, style: const TextStyle(fontStyle: FontStyle.italic)),
+            Text('de ${spot.spotter}'),
+            const SizedBox(height: 16),
+            FilledButton.tonal(
+              onPressed: widget.onLogQso != null ? () {
+                Navigator.of(ctx).pop();
+                widget.onLogQso!(QsoPreFill(
+                  callsign: spot.activator,
+                  freqMhz: spot.frequencyMhz,
+                  mode: spot.mode.isNotEmpty ? spot.mode : null,
+                  timeOn: DateTime.now().toUtc(),
+                  potaRef: spot.reference,
+                ));
+              } : null,
+              child: const Row(mainAxisSize: MainAxisSize.min, children: [
+                Icon(Icons.menu_book, size: 18),
+                SizedBox(width: 6),
+                Text('Log QSO'),
+              ]),
+            ),
+            SizedBox(height: MediaQuery.of(ctx).viewPadding.bottom),
+          ],
+        ),
+      ),
+    );
+  }
+
+  void _showSotaSpotDetail(SotaSpot spot) {
+    showModalBottomSheet(
+      context: context,
+      builder: (ctx) => Padding(
+        padding: const EdgeInsets.all(20),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(spot.activatorCallsign, style: const TextStyle(fontSize: 28, fontWeight: FontWeight.bold)),
+            const SizedBox(height: 8),
+            Text('${spot.summitCode} — ${spot.summitName}'),
+            const SizedBox(height: 4),
+            Text('${spot.frequencyKhz.toStringAsFixed(1)} kHz  ${spot.mode}'),
+            if (spot.comments.isNotEmpty)
+              Text(spot.comments, style: const TextStyle(fontStyle: FontStyle.italic)),
+            const SizedBox(height: 16),
+            FilledButton.tonal(
+              onPressed: widget.onLogQso != null ? () {
+                Navigator.of(ctx).pop();
+                widget.onLogQso!(QsoPreFill(
+                  callsign: spot.activatorCallsign,
+                  freqMhz: spot.frequencyMhz,
+                  mode: spot.mode.isNotEmpty ? spot.mode : null,
+                  timeOn: DateTime.now().toUtc(),
+                  sotaRef: spot.summitCode,
+                ));
+              } : null,
+              child: const Row(mainAxisSize: MainAxisSize.min, children: [
+                Icon(Icons.menu_book, size: 18),
+                SizedBox(width: 6),
+                Text('Log QSO'),
+              ]),
+            ),
+            SizedBox(height: MediaQuery.of(ctx).viewPadding.bottom),
+          ],
+        ),
+      ),
+    );
   }
 
   Future<void> _tuneToSpot(DxSpot spot) async {
@@ -469,30 +611,139 @@ class _SpotsScreenState extends State<SpotsScreen> {
     return '${t.hour.toString().padLeft(2, '0')}:${t.minute.toString().padLeft(2, '0')}';
   }
 
+  Widget _buildSourceSelector() {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+      child: SegmentedButton<_SpotSource>(
+        segments: const [
+          ButtonSegment(value: _SpotSource.cluster, label: Text('DX Cluster')),
+          ButtonSegment(value: _SpotSource.pota, label: Text('POTA')),
+          ButtonSegment(value: _SpotSource.sota, label: Text('SOTA')),
+        ],
+        selected: {_source},
+        onSelectionChanged: (selected) => _onSourceChanged(selected.first),
+      ),
+    );
+  }
+
+  Widget _buildPotaSotaBody(BuildContext context) {
+    final colorScheme = Theme.of(context).colorScheme;
+
+    if (_source == _SpotSource.pota) {
+      if (_potaLoading && _potaSpots.isEmpty) {
+        return const Expanded(child: Center(child: CircularProgressIndicator()));
+      }
+      if (_potaSpots.isEmpty) {
+        return Expanded(
+          child: Center(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Icon(Icons.park, size: 48, color: colorScheme.onSurfaceVariant),
+                const SizedBox(height: 12),
+                const Text('No POTA spots'),
+              ],
+            ),
+          ),
+        );
+      }
+      return Expanded(
+        child: ListView.separated(
+          itemCount: _potaSpots.length,
+          separatorBuilder: (_, __) => const Divider(height: 1),
+          itemBuilder: (context, index) {
+            final spot = _potaSpots[index];
+            return ListTile(
+              title: Text(spot.activator, style: const TextStyle(fontWeight: FontWeight.bold)),
+              subtitle: Text('${spot.reference} ${spot.parkName}'),
+              trailing: Column(
+                mainAxisAlignment: MainAxisAlignment.center,
+                crossAxisAlignment: CrossAxisAlignment.end,
+                children: [
+                  Text('${spot.frequencyKhz.toStringAsFixed(1)} kHz', style: const TextStyle(fontFamily: 'monospace')),
+                  Text(spot.mode, style: const TextStyle(fontSize: 12)),
+                ],
+              ),
+              onTap: () => _showPotaSpotDetail(spot),
+            );
+          },
+        ),
+      );
+    }
+
+    // SOTA
+    if (_sotaLoading && _sotaSpots.isEmpty) {
+      return const Expanded(child: Center(child: CircularProgressIndicator()));
+    }
+    if (_sotaSpots.isEmpty) {
+      return Expanded(
+        child: Center(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Icon(Icons.terrain, size: 48, color: colorScheme.onSurfaceVariant),
+              const SizedBox(height: 12),
+              const Text('No SOTA spots'),
+            ],
+          ),
+        ),
+      );
+    }
+    return Expanded(
+      child: ListView.separated(
+        itemCount: _sotaSpots.length,
+        separatorBuilder: (_, __) => const Divider(height: 1),
+        itemBuilder: (context, index) {
+          final spot = _sotaSpots[index];
+          return ListTile(
+            title: Text(spot.activatorCallsign, style: const TextStyle(fontWeight: FontWeight.bold)),
+            subtitle: Text('${spot.summitCode} ${spot.summitName}'),
+            trailing: Column(
+              mainAxisAlignment: MainAxisAlignment.center,
+              crossAxisAlignment: CrossAxisAlignment.end,
+              children: [
+                Text('${spot.frequencyKhz.toStringAsFixed(1)} kHz', style: const TextStyle(fontFamily: 'monospace')),
+                Text(spot.mode, style: const TextStyle(fontSize: 12)),
+              ],
+            ),
+            onTap: () => _showSotaSpotDetail(spot),
+          );
+        },
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     final colorScheme = Theme.of(context).colorScheme;
 
-    if (!_connected && _spots.isEmpty) {
-      return Center(
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Icon(Icons.radar, size: 64, color: colorScheme.onSurfaceVariant),
-            const SizedBox(height: 16),
-            const Text('DX Cluster not connected'),
-            if (_error != null) ...[
-              const SizedBox(height: 8),
-              Text(_error!, style: TextStyle(color: colorScheme.error, fontSize: 12)),
-            ],
-            const SizedBox(height: 16),
-            FilledButton.icon(
-              onPressed: _showSettings,
-              icon: const Icon(Icons.settings),
-              label: const Text('Configure & Connect'),
+    if (_source == _SpotSource.cluster && !_connected && _spots.isEmpty) {
+      return Column(
+        children: [
+          _buildSourceSelector(),
+          Expanded(
+            child: Center(
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Icon(Icons.radar, size: 64, color: colorScheme.onSurfaceVariant),
+                  const SizedBox(height: 16),
+                  const Text('DX Cluster not connected'),
+                  if (_error != null) ...[
+                    const SizedBox(height: 8),
+                    Text(_error!, style: TextStyle(color: colorScheme.error, fontSize: 12)),
+                  ],
+                  const SizedBox(height: 16),
+                  FilledButton.icon(
+                    onPressed: _showSettings,
+                    icon: const Icon(Icons.settings),
+                    label: const Text('Configure & Connect'),
+                  ),
+                ],
+              ),
             ),
-          ],
-        ),
+          ),
+        ],
       );
     }
 
@@ -500,184 +751,190 @@ class _SpotsScreenState extends State<SpotsScreen> {
 
     return Column(
       children: [
-        // Connection status bar
-        Container(
-          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-          color: colorScheme.surfaceContainerHighest,
-          child: Row(
-            children: [
-              Icon(
-                _connected ? Icons.cloud_done : Icons.cloud_off,
-                size: 16,
-                color: _connected ? Colors.green : colorScheme.error,
-              ),
-              const SizedBox(width: 8),
-              Expanded(
-                child: Text(
-                  _connected
-                      ? '$_clusterHost:$_clusterPort'
-                      : 'Disconnected',
-                  style: TextStyle(fontSize: 12, color: colorScheme.onSurfaceVariant),
-                ),
-              ),
-              IconButton(
-                icon: const Icon(Icons.settings, size: 18),
-                onPressed: _showSettings,
-                visualDensity: VisualDensity.compact,
-              ),
-            ],
-          ),
-        ),
+        _buildSourceSelector(),
 
-        // Filter bar
-        Container(
-          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
-          color: colorScheme.surfaceContainerHigh,
-          child: Row(
-            children: [
-              Flexible(
-                child: DropdownButtonHideUnderline(
-                  child: DropdownButton<String>(
-                    value: _bandFilter,
-                    isDense: true,
-                    style: TextStyle(fontSize: 13, color: colorScheme.onSurface),
-                    items: [
-                      for (final b in _bands)
-                        DropdownMenuItem(value: b, child: Text(b)),
-                    ],
-                    onChanged: (v) => setState(() => _bandFilter = v ?? 'All'),
+        if (_source == _SpotSource.cluster) ...[
+          // Connection status bar
+          Container(
+            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+            color: colorScheme.surfaceContainerHighest,
+            child: Row(
+              children: [
+                Icon(
+                  _connected ? Icons.cloud_done : Icons.cloud_off,
+                  size: 16,
+                  color: _connected ? Colors.green : colorScheme.error,
+                ),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: Text(
+                    _connected
+                        ? '$_clusterHost:$_clusterPort'
+                        : 'Disconnected',
+                    style: TextStyle(fontSize: 12, color: colorScheme.onSurfaceVariant),
                   ),
                 ),
-              ),
-              const SizedBox(width: 12),
-              Flexible(
-                child: DropdownButtonHideUnderline(
-                  child: DropdownButton<String>(
-                    value: _modeFilter,
-                    isDense: true,
-                    style: TextStyle(fontSize: 13, color: colorScheme.onSurface),
-                    items: [
-                      for (final m in _modes)
-                        DropdownMenuItem(value: m, child: Text(m)),
-                    ],
-                    onChanged: (v) => setState(() => _modeFilter = v ?? 'All'),
-                  ),
-                ),
-              ),
-              const SizedBox(width: 8),
-              FilterChip(
-                label: const Text('Needed'),
-                selected: _neededOnly,
-                onSelected: (v) => setState(() {
-                  _neededOnly = v;
-                  if (v) _newBandOnly = false;
-                }),
-                visualDensity: VisualDensity.compact,
-                materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
-                labelStyle: const TextStyle(fontSize: 11),
-              ),
-              const SizedBox(width: 6),
-              FilterChip(
-                label: const Text('New Band'),
-                selected: _newBandOnly,
-                onSelected: (v) => setState(() {
-                  _newBandOnly = v;
-                  if (v) _neededOnly = false;
-                }),
-                visualDensity: VisualDensity.compact,
-                materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
-                labelStyle: const TextStyle(fontSize: 11),
-              ),
-              const Spacer(),
-              Text(
-                '${filtered.length} spot${filtered.length == 1 ? '' : 's'}',
-                style: TextStyle(fontSize: 12, color: colorScheme.onSurfaceVariant),
-              ),
-              if (_hasFilters) ...[
-                const SizedBox(width: 4),
-                InkWell(
-                  onTap: _clearFilters,
-                  child: Padding(
-                    padding: const EdgeInsets.all(4),
-                    child: Icon(Icons.filter_alt_off, size: 18, color: colorScheme.primary),
-                  ),
+                IconButton(
+                  icon: const Icon(Icons.settings, size: 18),
+                  onPressed: _showSettings,
+                  visualDensity: VisualDensity.compact,
                 ),
               ],
-            ],
+            ),
           ),
-        ),
 
-        // Column headers
-        Container(
-          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
-          color: colorScheme.surfaceContainerHighest,
-          child: Row(
-            children: [
-              _ColumnHeader(label: 'Freq', col: _SortColumn.frequency, current: _sortColumn, ascending: _sortAscending, onTap: _toggleSort),
-              const SizedBox(width: 12),
-              Expanded(child: _ColumnHeader(label: 'DX', col: _SortColumn.dxCall, current: _sortColumn, ascending: _sortAscending, onTap: _toggleSort)),
-              Expanded(child: _ColumnHeader(label: 'Spotter', col: _SortColumn.spotter, current: _sortColumn, ascending: _sortAscending, onTap: _toggleSort)),
-              _ColumnHeader(label: 'Time', col: _SortColumn.time, current: _sortColumn, ascending: _sortAscending, onTap: _toggleSort),
-            ],
-          ),
-        ),
-
-        // Spot list or empty state
-        Expanded(
-          child: filtered.isEmpty
-              ? Center(
-                  child: Column(
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      Icon(Icons.filter_alt, size: 48, color: colorScheme.onSurfaceVariant),
-                      const SizedBox(height: 12),
-                      const Text('No spots match your filters'),
-                      const SizedBox(height: 12),
-                      TextButton.icon(
-                        onPressed: _clearFilters,
-                        icon: const Icon(Icons.filter_alt_off),
-                        label: const Text('Clear Filters'),
-                      ),
-                    ],
+          // Filter bar
+          Container(
+            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+            color: colorScheme.surfaceContainerHigh,
+            child: Row(
+              children: [
+                Flexible(
+                  child: DropdownButtonHideUnderline(
+                    child: DropdownButton<String>(
+                      value: _bandFilter,
+                      isDense: true,
+                      style: TextStyle(fontSize: 13, color: colorScheme.onSurface),
+                      items: [
+                        for (final b in _bands)
+                          DropdownMenuItem(value: b, child: Text(b)),
+                      ],
+                      onChanged: (v) => setState(() => _bandFilter = v ?? 'All'),
+                    ),
                   ),
-                )
-              : ListView.separated(
-                  itemCount: filtered.length,
-                  separatorBuilder: (_, __) => const Divider(height: 1),
-                  itemBuilder: (context, index) {
-                    final spot = filtered[index];
-                    final dupeIcon = _spotDupeIndicator(spot);
-                    return ListTile(
-                      dense: true,
-                      leading: Text(
-                        spot.frequencyKhz.toStringAsFixed(1),
-                        style: TextStyle(
-                          fontWeight: FontWeight.bold,
-                          fontSize: 15,
-                          color: colorScheme.primary,
-                          fontFamily: 'monospace',
-                        ),
-                      ),
-                      title: Row(
-                        children: [
-                          Text(spot.dxCall, style: const TextStyle(fontWeight: FontWeight.bold)),
-                          if (dupeIcon != null) ...[
-                            const SizedBox(width: 6),
-                            dupeIcon,
-                          ],
-                        ],
-                      ),
-                      subtitle: Text('de ${spot.spotter}  ${spot.comment}'),
-                      trailing: Text(
-                        _formatTime(spot.time),
-                        style: TextStyle(color: colorScheme.onSurfaceVariant, fontSize: 12),
-                      ),
-                      onTap: () => _showSpotDetail(spot),
-                      onLongPress: () => _tuneToSpot(spot),
-                    );
-                  },
                 ),
-        ),
+                const SizedBox(width: 12),
+                Flexible(
+                  child: DropdownButtonHideUnderline(
+                    child: DropdownButton<String>(
+                      value: _modeFilter,
+                      isDense: true,
+                      style: TextStyle(fontSize: 13, color: colorScheme.onSurface),
+                      items: [
+                        for (final m in _modes)
+                          DropdownMenuItem(value: m, child: Text(m)),
+                      ],
+                      onChanged: (v) => setState(() => _modeFilter = v ?? 'All'),
+                    ),
+                  ),
+                ),
+                const SizedBox(width: 8),
+                FilterChip(
+                  label: const Text('Needed'),
+                  selected: _neededOnly,
+                  onSelected: (v) => setState(() {
+                    _neededOnly = v;
+                    if (v) _newBandOnly = false;
+                  }),
+                  visualDensity: VisualDensity.compact,
+                  materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                  labelStyle: const TextStyle(fontSize: 11),
+                ),
+                const SizedBox(width: 6),
+                FilterChip(
+                  label: const Text('New Band'),
+                  selected: _newBandOnly,
+                  onSelected: (v) => setState(() {
+                    _newBandOnly = v;
+                    if (v) _neededOnly = false;
+                  }),
+                  visualDensity: VisualDensity.compact,
+                  materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                  labelStyle: const TextStyle(fontSize: 11),
+                ),
+                const Spacer(),
+                Text(
+                  '${filtered.length} spot${filtered.length == 1 ? '' : 's'}',
+                  style: TextStyle(fontSize: 12, color: colorScheme.onSurfaceVariant),
+                ),
+                if (_hasFilters) ...[
+                  const SizedBox(width: 4),
+                  InkWell(
+                    onTap: _clearFilters,
+                    child: Padding(
+                      padding: const EdgeInsets.all(4),
+                      child: Icon(Icons.filter_alt_off, size: 18, color: colorScheme.primary),
+                    ),
+                  ),
+                ],
+              ],
+            ),
+          ),
+
+          // Column headers
+          Container(
+            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
+            color: colorScheme.surfaceContainerHighest,
+            child: Row(
+              children: [
+                _ColumnHeader(label: 'Freq', col: _SortColumn.frequency, current: _sortColumn, ascending: _sortAscending, onTap: _toggleSort),
+                const SizedBox(width: 12),
+                Expanded(child: _ColumnHeader(label: 'DX', col: _SortColumn.dxCall, current: _sortColumn, ascending: _sortAscending, onTap: _toggleSort)),
+                Expanded(child: _ColumnHeader(label: 'Spotter', col: _SortColumn.spotter, current: _sortColumn, ascending: _sortAscending, onTap: _toggleSort)),
+                _ColumnHeader(label: 'Time', col: _SortColumn.time, current: _sortColumn, ascending: _sortAscending, onTap: _toggleSort),
+              ],
+            ),
+          ),
+
+          // Spot list or empty state
+          Expanded(
+            child: filtered.isEmpty
+                ? Center(
+                    child: Column(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Icon(Icons.filter_alt, size: 48, color: colorScheme.onSurfaceVariant),
+                        const SizedBox(height: 12),
+                        const Text('No spots match your filters'),
+                        const SizedBox(height: 12),
+                        TextButton.icon(
+                          onPressed: _clearFilters,
+                          icon: const Icon(Icons.filter_alt_off),
+                          label: const Text('Clear Filters'),
+                        ),
+                      ],
+                    ),
+                  )
+                : ListView.separated(
+                    itemCount: filtered.length,
+                    separatorBuilder: (_, __) => const Divider(height: 1),
+                    itemBuilder: (context, index) {
+                      final spot = filtered[index];
+                      final dupeIcon = _spotDupeIndicator(spot);
+                      return ListTile(
+                        dense: true,
+                        leading: Text(
+                          spot.frequencyKhz.toStringAsFixed(1),
+                          style: TextStyle(
+                            fontWeight: FontWeight.bold,
+                            fontSize: 15,
+                            color: colorScheme.primary,
+                            fontFamily: 'monospace',
+                          ),
+                        ),
+                        title: Row(
+                          children: [
+                            Text(spot.dxCall, style: const TextStyle(fontWeight: FontWeight.bold)),
+                            if (dupeIcon != null) ...[
+                              const SizedBox(width: 6),
+                              dupeIcon,
+                            ],
+                          ],
+                        ),
+                        subtitle: Text('de ${spot.spotter}  ${spot.comment}'),
+                        trailing: Text(
+                          _formatTime(spot.time),
+                          style: TextStyle(color: colorScheme.onSurfaceVariant, fontSize: 12),
+                        ),
+                        onTap: () => _showSpotDetail(spot),
+                        onLongPress: () => _tuneToSpot(spot),
+                      );
+                    },
+                  ),
+          ),
+        ] else ...[
+          _buildPotaSotaBody(context),
+        ],
       ],
     );
   }

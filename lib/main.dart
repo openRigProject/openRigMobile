@@ -1,12 +1,12 @@
 import 'package:flutter/material.dart';
 
 import 'connection_state.dart';
+import 'services/aprs_carplay_channel.dart';
 import 'services/settings_service.dart';
-import 'screens/discovery_screen.dart';
 import 'screens/spots_screen.dart';
-import 'screens/rig_screen.dart';
 import 'screens/log_screen.dart' show LogScreen, LogScreenState, QsoPreFill;
 import 'screens/device_screen.dart';
+import 'screens/aprs_screen.dart';
 import 'screens/settings_screen.dart';
 
 void main() async {
@@ -36,9 +36,14 @@ class _OpenRigMobileAppState extends State<OpenRigMobileApp> {
   }
 
   Future<void> _tryAutoConnect() async {
-    _appState.restoreFromSettings();
-    if (_appState.device != null) {
-      await _appState.connectRig();
+    try {
+      _appState.restoreFromSettings();
+      if (_appState.device != null) {
+        await _appState.connectRig();
+      }
+    } catch (_) {
+      // Device unreachable — clear it so we don't crash on next launch
+      _appState.disconnectDevice();
     }
   }
 
@@ -59,11 +64,7 @@ class _OpenRigMobileAppState extends State<OpenRigMobileApp> {
         ),
         useMaterial3: true,
       ),
-      initialRoute: _appState.device != null ? '/home' : '/discovery',
-      routes: {
-        '/discovery': (_) => DiscoveryScreen(appState: _appState),
-        '/home': (_) => HomeScreen(appState: _appState),
-      },
+      home: HomeScreen(appState: _appState),
     );
   }
 }
@@ -80,9 +81,22 @@ class HomeScreen extends StatefulWidget {
 class _HomeScreenState extends State<HomeScreen> {
   int _selectedIndex = 0;
   final _logKey = GlobalKey<LogScreenState>();
+  late final AprsCarPlayChannel _carPlayChannel;
+
+  @override
+  void initState() {
+    super.initState();
+    _carPlayChannel = AprsCarPlayChannel();
+  }
+
+  @override
+  void dispose() {
+    _carPlayChannel.dispose();
+    super.dispose();
+  }
 
   void _logQsoFromSpot(QsoPreFill preFill) {
-    setState(() => _selectedIndex = 2); // Switch to Log tab
+    setState(() => _selectedIndex = 0); // Switch to Log tab
     // Schedule dialog after the frame so the LogScreen is built
     WidgetsBinding.instance.addPostFrameCallback((_) {
       _logKey.currentState?.openNewQsoDialog(preFill: preFill);
@@ -92,13 +106,13 @@ class _HomeScreenState extends State<HomeScreen> {
   @override
   Widget build(BuildContext context) {
     final screens = <Widget>[
+      LogScreen(key: _logKey, appState: widget.appState),
       SpotsScreen(
         appState: widget.appState,
         onLogQso: _logQsoFromSpot,
       ),
-      RigScreen(appState: widget.appState),
-      LogScreen(key: _logKey, appState: widget.appState),
-      DeviceScreen(appState: widget.appState),
+      DeviceScreen(appState: widget.appState, onLogQso: _logQsoFromSpot),
+      AprsScreen(appState: widget.appState, carPlayChannel: _carPlayChannel),
     ];
 
     return Scaffold(
@@ -138,10 +152,10 @@ class _HomeScreenState extends State<HomeScreen> {
         selectedIndex: _selectedIndex,
         onDestinationSelected: (index) => setState(() => _selectedIndex = index),
         destinations: const [
-          NavigationDestination(icon: Icon(Icons.radar), label: 'Spots'),
-          NavigationDestination(icon: Icon(Icons.settings_remote), label: 'Rig Control'),
           NavigationDestination(icon: Icon(Icons.menu_book), label: 'Log'),
-          NavigationDestination(icon: Icon(Icons.router), label: 'Device'),
+          NavigationDestination(icon: Icon(Icons.radar), label: 'Spots'),
+          NavigationDestination(icon: Icon(Icons.router), label: 'Devices'),
+          NavigationDestination(icon: Icon(Icons.my_location), label: 'APRS'),
         ],
       ),
     );

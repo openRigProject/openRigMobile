@@ -1,78 +1,190 @@
+import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:openrig_core/openrig_core.dart' hide ChangeNotifier;
 
 import '../connection_state.dart';
+import '../services/native_discovery.dart';
+import '../widgets/map_widget.dart';
+import 'log_screen.dart' show QsoPreFill;
 
 class DeviceScreen extends StatefulWidget {
   final AppConnectionState appState;
+  final void Function(QsoPreFill preFill)? onLogQso;
 
-  const DeviceScreen({super.key, required this.appState});
+  const DeviceScreen({super.key, required this.appState, this.onLogQso});
 
   @override
   State<DeviceScreen> createState() => _DeviceScreenState();
 }
 
 class _DeviceScreenState extends State<DeviceScreen> {
-  HotspotMonitor? _monitor;
-  Future<NetworkStatus?>? _networkFuture;
-  Future<List<WifiNetwork>?>? _wifiFuture;
+  OpenRigHotspotClient? _client;
+  DeviceStatus? _status;
+  HotspotConfig? _hotspot;
+  NetworkStatus? _network;
+  List<WifiNetwork>? _wifiNetworks;
+  bool _loading = false;
+  String? _error;
+
+  // Last Heard state (inline)
+  StreamSubscription<HotspotLastHeardEntry>? _lastHeardSub;
+  final List<HotspotLastHeardEntry> _lastHeard = [];
+  final ValueNotifier<MapLocation?> _mapLocation = ValueNotifier(null);
+
+  // QRZ callsign lookup with cache
+  QrzXmlClient? _qrzClient;
+  CallsignInfo? _callsignInfo;
+  String? _lastLookedUp;
+  final Map<String, CallsignInfo> _callsignCache = {};
 
   @override
   void initState() {
     super.initState();
-    _initMonitor();
+    _loadDevice();
   }
 
   @override
   void didUpdateWidget(DeviceScreen old) {
     super.didUpdateWidget(old);
     if (widget.appState.device?.host != old.appState.device?.host) {
-      _disposeMonitor();
-      _initMonitor();
+      _disposeClient();
+      _loadDevice();
     }
   }
 
   @override
   void dispose() {
-    _disposeMonitor();
+    _disposeClient();
+    _mapLocation.dispose();
     super.dispose();
   }
 
-  void _disposeMonitor() {
-    _monitor?.dispose();
-    _monitor = null;
-    _networkFuture = null;
-    _wifiFuture = null;
+  void _disposeClient() {
+    _lastHeardSub?.cancel();
+    _lastHeardSub = null;
+    _lastHeard.clear();
+    _mapLocation.value = null;
+    _qrzClient?.dispose();
+    _qrzClient = null;
+    _callsignInfo = null;
+    _lastLookedUp = null;
+    _client?.dispose();
+    _client = null;
+    _status = null;
+    _hotspot = null;
+    _network = null;
+    _wifiNetworks = null;
   }
 
-  void _initMonitor() {
+  void _disconnect() {
+    _disposeClient();
+    widget.appState.disconnectDevice();
+    if (mounted) setState(() {});
+  }
+
+  Future<void> _loadDevice() async {
     final device = widget.appState.device;
     if (device == null) return;
-    _monitor = HotspotMonitor(host: device.host);
-    _monitor!.start();
-    _networkFuture = _fetchNetwork(device.host);
-    _wifiFuture = _fetchWifi(device.host);
-  }
 
-  Future<List<WifiNetwork>?> _fetchWifi(String host) async {
+    setState(() {
+      _loading = true;
+      _error = null;
+    });
+
+    _lastHeardSub?.cancel();
+    _client?.dispose();
+    final client = OpenRigHotspotClient(host: device.host);
+    _client = client;
+
     try {
-      final api = OpenRigApiClient(host: host, port: 7373);
-      final result = await api.getWifi();
-      api.dispose();
-      return result;
-    } catch (_) {
-      return null;
+      final status = await client.getStatus();
+      NetworkStatus? network;
+      try { network = await client.getNetworkStatus(); } catch (_) {}
+      List<WifiNetwork>? wifiNetworks;
+      try { wifiNetworks = await client.getWifi(); } catch (_) {}
+      HotspotConfig? hotspot;
+      if (status.type == 'hotspot') {
+        hotspot = await client.getHotspotConfig();
+      }
+      if (!mounted) return;
+      setState(() {
+        _status = status;
+        _network = network;
+        _wifiNetworks = wifiNetworks;
+        _hotspot = hotspot;
+        _loading = false;
+      });
+      // Start last heard stream for hotspots
+      if (status.type == 'hotspot') {
+        _lastHeardSub = client.streamLastHeard().listen(_onLastHeardEntry);
+      }
+    } catch (e) {
+      if (mounted) {
+        setState(() {
+          _loading = false;
+          _error = e.toString();
+        });
+      }
     }
   }
 
-  Future<NetworkStatus?> _fetchNetwork(String host) async {
+  void _onLastHeardEntry(HotspotLastHeardEntry entry) {
+    if (!mounted) return;
+    setState(() {
+      final sameIdx = _lastHeard.indexWhere((e) => e.sameTransmission(entry));
+      if (sameIdx >= 0) {
+        _lastHeard[sameIdx] = entry;
+        return;
+      }
+      _lastHeard.removeWhere((e) => e.callsign == entry.callsign && e.mode == entry.mode);
+      _lastHeard.insert(0, entry);
+      if (_lastHeard.length > 50) _lastHeard.removeLast();
+    });
+    // Look up the new top callsign
+    if (_lastHeard.isNotEmpty) {
+      _lookupCallsign(_lastHeard.first.callsign);
+    }
+  }
+
+  Future<void> _lookupCallsign(String callsign) async {
+    if (callsign == _lastLookedUp) return;
+    _lastLookedUp = callsign;
+
+    // Check cache first
+    final cached = _callsignCache[callsign];
+    if (cached != null) {
+      _showCallsignInfo(cached);
+      return;
+    }
+
+    final settings = widget.appState.settings;
+    final user = settings?.qrzXmlUser ?? '';
+    final pass = settings?.qrzXmlPass ?? '';
+    if (user.isEmpty || pass.isEmpty) return;
+
+    _qrzClient ??= QrzXmlClient(username: user, password: pass);
+
     try {
-      final api = OpenRigApiClient(host: host, port: 7373);
-      final result = await api.getNetworkStatus();
-      api.dispose();
-      return result;
+      final info = await _qrzClient!.lookupCallsign(callsign);
+      if (!mounted) return;
+      _callsignCache[callsign] = info;
+      _showCallsignInfo(info);
     } catch (_) {
-      return null;
+      // QRZ lookup failed — leave previous info
+    }
+  }
+
+  void _showCallsignInfo(CallsignInfo info) {
+    setState(() => _callsignInfo = info);
+    if (info.grid.length >= 4) {
+      final ll = gridToLatLon(info.grid);
+      if (ll != null) {
+        _mapLocation.value = MapLocation(
+          lat: ll.lat,
+          lon: ll.lon,
+          callsign: info.call,
+        );
+      }
     }
   }
 
@@ -88,7 +200,7 @@ class _DeviceScreenState extends State<DeviceScreen> {
   Future<void> _restartServices(HotspotConfig? hotspot, DeviceStatus? status) async {
     final device = widget.appState.device;
     if (device == null) return;
-    final api = OpenRigApiClient(host: device.host, port: 7373);
+    final client = OpenRigHotspotClient(host: device.host);
     final type = status?.type ?? device.type;
     final services = <String>[];
     if (type == 'hotspot') {
@@ -101,17 +213,11 @@ class _DeviceScreenState extends State<DeviceScreen> {
 
     try {
       for (final s in services) {
-        await api.restartService(s);
+        await client.restartService(s);
       }
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
           const SnackBar(content: Text('Services restarted')),
-        );
-      }
-    } on OpenRigApiException catch (e) {
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Restart failed: ${e.statusCode}')),
         );
       }
     } catch (e) {
@@ -121,7 +227,7 @@ class _DeviceScreenState extends State<DeviceScreen> {
         );
       }
     } finally {
-      api.dispose();
+      client.dispose();
     }
   }
 
@@ -146,9 +252,9 @@ class _DeviceScreenState extends State<DeviceScreen> {
       ),
     );
     if (confirmed != true || !mounted) return;
-    final api = OpenRigApiClient(host: device.host, port: 7373);
+    final client = OpenRigHotspotClient(host: device.host);
     try {
-      await api.reboot();
+      await client.reboot();
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
           const SnackBar(content: Text('Rebooting\u2026')),
@@ -161,53 +267,10 @@ class _DeviceScreenState extends State<DeviceScreen> {
         );
       }
     } finally {
-      api.dispose();
+      client.dispose();
     }
   }
 
-  Future<void> _shutdown() async {
-    final device = widget.appState.device;
-    if (device == null) return;
-    final confirmed = await showDialog<bool>(
-      context: context,
-      builder: (ctx) => AlertDialog(
-        title: const Text('Shut Down Device?'),
-        content: Text(
-          '${device.name} will power off. '
-          'You will need physical access to turn it back on.',
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.of(ctx).pop(false),
-            child: const Text('Cancel'),
-          ),
-          FilledButton(
-            style: FilledButton.styleFrom(backgroundColor: Colors.red),
-            onPressed: () => Navigator.of(ctx).pop(true),
-            child: const Text('Shut Down'),
-          ),
-        ],
-      ),
-    );
-    if (confirmed != true || !mounted) return;
-    final api = OpenRigApiClient(host: device.host, port: 7373);
-    try {
-      await api.shutdown();
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('Shutting down\u2026')),
-        );
-      }
-    } catch (e) {
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Shutdown failed: $e')),
-        );
-      }
-    } finally {
-      api.dispose();
-    }
-  }
 
   void _showManageHotspot(HotspotConfig config) {
     final device = widget.appState.device;
@@ -222,112 +285,409 @@ class _DeviceScreenState extends State<DeviceScreen> {
     );
   }
 
+  void _openDeviceInfo() {
+    Navigator.of(context).push(
+      MaterialPageRoute(
+        builder: (_) => _DeviceInfoScreen(
+          appState: widget.appState,
+          status: _status,
+          hotspot: _hotspot,
+          network: _network,
+          wifiNetworks: _wifiNetworks,
+          formatUptime: _formatUptime,
+          onRestartServices: () => _restartServices(_hotspot, _status),
+          onReboot: _reboot,
+          onShowManageHotspot: _hotspot != null
+              ? () => _showManageHotspot(_hotspot!)
+              : null,
+        ),
+      ),
+    );
+  }
+
+  Color _modeColor(String mode) {
+    switch (mode.toUpperCase()) {
+      case 'DMR':
+        return Colors.blue;
+      case 'YSF':
+        return Colors.orange;
+      case 'DSTAR':
+      case 'D-STAR':
+        return Colors.green;
+      case 'NXDN':
+        return Colors.purple;
+      case 'P25':
+        return Colors.red;
+      default:
+        return Colors.grey;
+    }
+  }
+
+  String _formatTime(String timestamp) {
+    final dt = DateTime.tryParse(timestamp);
+    if (dt == null) return timestamp;
+    final utc = dt.toUtc();
+    return '${utc.hour.toString().padLeft(2, '0')}:'
+        '${utc.minute.toString().padLeft(2, '0')}:'
+        '${utc.second.toString().padLeft(2, '0')}z';
+  }
+
+  void _onTapEntry(HotspotLastHeardEntry entry) {
+    _lookupCallsign(entry.callsign);
+  }
+
+  void _onLongPressEntry(HotspotLastHeardEntry entry) {
+    final colorScheme = Theme.of(context).colorScheme;
+    final cached = _callsignCache[entry.callsign];
+    final freqMhz = _hotspot?.rfFrequencyMhz ?? 0.0;
+
+    showModalBottomSheet(
+      context: context,
+      builder: (ctx) => SafeArea(
+        child: Padding(
+          padding: const EdgeInsets.all(16),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
+                entry.callsign,
+                style: const TextStyle(fontSize: 22, fontWeight: FontWeight.bold),
+              ),
+              if (cached != null && cached.fullName.isNotEmpty)
+                Text(cached.fullName, style: const TextStyle(fontSize: 14)),
+              if (cached != null) ...[
+                Text(
+                  [
+                    if (cached.city.isNotEmpty) cached.city,
+                    if (cached.state.isNotEmpty) cached.state,
+                    if (cached.country.isNotEmpty) cached.country,
+                  ].join(', '),
+                  style: TextStyle(fontSize: 12, color: colorScheme.onSurfaceVariant),
+                ),
+              ],
+              const SizedBox(height: 8),
+              Wrap(
+                spacing: 8,
+                children: [
+                  Chip(label: Text(entry.mode.toUpperCase())),
+                  if (entry.info.isNotEmpty) Chip(label: Text(entry.info)),
+                  if (freqMhz > 0)
+                    Chip(label: Text('${freqMhz.toStringAsFixed(4)} MHz')),
+                ],
+              ),
+              const SizedBox(height: 16),
+              SizedBox(
+                width: double.infinity,
+                child: FilledButton.icon(
+                  onPressed: () {
+                    Navigator.of(ctx).pop();
+                    _logQso(entry);
+                  },
+                  icon: const Icon(Icons.menu_book),
+                  label: const Text('Log QSO'),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+
+    // Also trigger QRZ lookup if not cached
+    if (cached == null) _lookupCallsign(entry.callsign);
+  }
+
+  void _logQso(HotspotLastHeardEntry entry) {
+    final freqMhz = _hotspot?.rfFrequencyMhz ?? 0.0;
+    final timeOn = DateTime.tryParse(entry.timestamp)?.toUtc();
+    final preFill = QsoPreFill(
+      callsign: entry.callsign,
+      freqMhz: freqMhz > 0 ? freqMhz : null,
+      mode: entry.mode.toUpperCase(),
+      timeOn: timeOn,
+    );
+    widget.onLogQso?.call(preFill);
+  }
+
   @override
   Widget build(BuildContext context) {
     final device = widget.appState.device;
 
-    if (device == null || _monitor == null) {
-      return const Center(child: Text('No device selected'));
+    if (device == null) {
+      return _DeviceDiscoveryView(
+        onDeviceSelected: (d) {
+          widget.appState.setDevice(d);
+          widget.appState.connectRig();
+          if (mounted) _loadDevice();
+        },
+        onManualConnect: (host) {
+          widget.appState.setManualDevice(host);
+          widget.appState.connectRig();
+          if (mounted) _loadDevice();
+        },
+      );
     }
 
-    return StreamBuilder<DeviceStatus>(
-      stream: _monitor!.status,
-      builder: (context, statusSnap) {
-        final status = statusSnap.data;
-        final type = status?.type ?? device.type;
-        final isHotspot = type == 'hotspot';
-        final isRigctl = type == 'rigctl' || type == 'console';
-
-        // Show loading only if we have no data at all yet
-        if (statusSnap.connectionState == ConnectionState.waiting &&
-            !statusSnap.hasData) {
-          return const Center(child: CircularProgressIndicator());
-        }
-
-        return ListView(
-          padding: const EdgeInsets.all(16),
+    if (_loading) {
+      return Center(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
           children: [
-            _StatusCard(
-              appState: widget.appState,
-              status: status,
-              formatUptime: _formatUptime,
-            ),
-            const SizedBox(height: 12),
-            FutureBuilder<NetworkStatus?>(
-              future: _networkFuture,
-              builder: (context, snap) {
-                final net = snap.data;
-                if (net == null) return const SizedBox.shrink();
-                return Column(
-                  children: [
-                    _NetworkCard(network: net),
-                    const SizedBox(height: 12),
-                  ],
-                );
-              },
-            ),
-            FutureBuilder<List<WifiNetwork>?>(
-              future: _wifiFuture,
-              builder: (context, snap) {
-                final networks = snap.data;
-                if (networks == null) return const SizedBox.shrink();
-                return Column(
-                  children: [
-                    _WifiCard(
-                      networks: networks,
-                      deviceHost: widget.appState.device!.host,
-                    ),
-                    const SizedBox(height: 12),
-                  ],
-                );
-              },
-            ),
-            if (isHotspot) ...[
-              StreamBuilder<HotspotConfig>(
-                stream: _monitor!.hotspot,
-                builder: (context, hotspotSnap) {
-                  return StreamBuilder<List<HotspotClient>>(
-                    stream: _monitor!.clients,
-                    builder: (context, clientsSnap) {
-                      final hotspot = hotspotSnap.data;
-                      final clients = clientsSnap.data ?? [];
-                      if (hotspot == null) {
-                        return const Card(
-                          child: Padding(
-                            padding: EdgeInsets.all(32),
-                            child: Center(child: CircularProgressIndicator()),
-                          ),
-                        );
-                      }
-                      return _HotspotCard(
-                        config: hotspot,
-                        clientCount: clients.length,
-                        onManage: () => _showManageHotspot(hotspot),
-                      );
-                    },
-                  );
-                },
-              ),
-              const SizedBox(height: 12),
-            ],
-            if (isRigctl) ...[
-              const _RigCard(),
-              const SizedBox(height: 12),
-            ],
-            StreamBuilder<HotspotConfig>(
-              stream: _monitor!.hotspot,
-              builder: (context, hotspotSnap) {
-                return _QuickActionsCard(
-                  onRestart: () =>
-                      _restartServices(hotspotSnap.data, status),
-                  onReboot: _reboot,
-                  onShutdown: _shutdown,
-                );
-              },
+            const CircularProgressIndicator(),
+            const SizedBox(height: 16),
+            Text('Connecting to ${device.host}...'),
+            const SizedBox(height: 24),
+            TextButton.icon(
+              onPressed: _disconnect,
+              icon: const Icon(Icons.link_off),
+              label: const Text('Back'),
             ),
           ],
-        );
-      },
+        ),
+      );
+    }
+
+    if (_error != null) {
+      return Center(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const Icon(Icons.error_outline, size: 48, color: Colors.red),
+            const SizedBox(height: 16),
+            Text('Failed to connect to ${device.host}'),
+            const SizedBox(height: 8),
+            Text(_error!, style: TextStyle(fontSize: 12, color: Theme.of(context).colorScheme.onSurfaceVariant)),
+            const SizedBox(height: 24),
+            FilledButton.icon(
+              onPressed: () => _loadDevice(),
+              icon: const Icon(Icons.refresh),
+              label: const Text('Retry'),
+            ),
+            const SizedBox(height: 8),
+            TextButton.icon(
+              onPressed: _disconnect,
+              icon: const Icon(Icons.link_off),
+              label: const Text('Back'),
+            ),
+          ],
+        ),
+      );
+    }
+
+    final colorScheme = Theme.of(context).colorScheme;
+    final callsign = _status?.callsign ?? device.callsign;
+    final label = callsign.isNotEmpty ? callsign : device.host;
+
+    // Main view: Map + Last Heard stream with bottom device info button
+    return Column(
+      children: [
+        // Back row
+        Padding(
+          padding: const EdgeInsets.fromLTRB(4, 8, 16, 0),
+          child: Row(
+            children: [
+              IconButton(
+                icon: const Icon(Icons.arrow_back),
+                onPressed: _disconnect,
+                tooltip: 'Change Device',
+              ),
+              Text(label, style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w600)),
+              const Spacer(),
+              if (_status != null)
+                _TypeBadge(type: _status!.type),
+            ],
+          ),
+        ),
+        const Divider(height: 1),
+        // Map — top portion
+        SizedBox(
+          height: 200,
+          child: MapWidget(location: _mapLocation),
+        ),
+        // Callsign info bar
+        if (_callsignInfo != null)
+          Container(
+            width: double.infinity,
+            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+            color: colorScheme.surfaceContainerHighest,
+            child: Row(
+              children: [
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        _callsignInfo!.call,
+                        style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+                      ),
+                      if (_callsignInfo!.fullName.isNotEmpty)
+                        Text(_callsignInfo!.fullName, style: const TextStyle(fontSize: 14)),
+                      Text(
+                        [
+                          if (_callsignInfo!.city.isNotEmpty) _callsignInfo!.city,
+                          if (_callsignInfo!.state.isNotEmpty) _callsignInfo!.state,
+                          if (_callsignInfo!.country.isNotEmpty) _callsignInfo!.country,
+                        ].join(', '),
+                        style: TextStyle(fontSize: 12, color: colorScheme.onSurfaceVariant),
+                      ),
+                    ],
+                  ),
+                ),
+                if (_callsignInfo!.grid.isNotEmpty)
+                  Chip(label: Text(_callsignInfo!.grid, style: const TextStyle(fontSize: 12))),
+              ],
+            ),
+          ),
+        const Divider(height: 1),
+        // Last Heard list
+        Expanded(
+          child: _lastHeard.isEmpty
+              ? Center(
+                  child: Text(
+                    'Waiting for activity\u2026',
+                    style: TextStyle(color: colorScheme.onSurfaceVariant),
+                  ),
+                )
+              : ListView.separated(
+                  itemCount: _lastHeard.length,
+                  separatorBuilder: (_, __) => const Divider(height: 1),
+                  itemBuilder: (context, index) {
+                    final entry = _lastHeard[index];
+                    final mode = entry.mode.toUpperCase();
+                    final color = _modeColor(mode);
+
+                    return ListTile(
+                      onTap: () => _onTapEntry(entry),
+                      onLongPress: () => _onLongPressEntry(entry),
+                      leading: Container(
+                        width: 48,
+                        height: 28,
+                        alignment: Alignment.center,
+                        decoration: BoxDecoration(
+                          color: color.withAlpha(40),
+                          borderRadius: BorderRadius.circular(4),
+                        ),
+                        child: Text(
+                          mode,
+                          style: TextStyle(
+                            fontSize: 12,
+                            fontWeight: FontWeight.bold,
+                            color: color,
+                          ),
+                        ),
+                      ),
+                      title: Text(
+                        entry.callsign,
+                        style: const TextStyle(fontWeight: FontWeight.bold),
+                      ),
+                      subtitle: Text(
+                        entry.info.isNotEmpty
+                            ? '${entry.info}${entry.isActive ? '  LIVE' : '  ${entry.duration}'}'
+                            : entry.isActive
+                                ? 'LIVE'
+                                : entry.duration,
+                      ),
+                      trailing: Text(
+                        _formatTime(entry.timestamp),
+                        style: TextStyle(
+                          fontSize: 12,
+                          color: colorScheme.onSurfaceVariant,
+                        ),
+                      ),
+                      tileColor: entry.isActive
+                          ? colorScheme.primary.withAlpha(20)
+                          : null,
+                    );
+                  },
+                ),
+        ),
+        // Bottom device info button
+        SafeArea(
+          top: false,
+          child: Padding(
+            padding: const EdgeInsets.fromLTRB(16, 8, 16, 8),
+            child: SizedBox(
+              width: double.infinity,
+              child: FilledButton.tonalIcon(
+                onPressed: _openDeviceInfo,
+                icon: const Icon(Icons.info_outline),
+                label: const Text('Device Info'),
+              ),
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+// -- Device Info Screen (pushed from main view) --
+
+class _DeviceInfoScreen extends StatelessWidget {
+  final AppConnectionState appState;
+  final DeviceStatus? status;
+  final HotspotConfig? hotspot;
+  final NetworkStatus? network;
+  final List<WifiNetwork>? wifiNetworks;
+  final String Function(int) formatUptime;
+  final VoidCallback onRestartServices;
+  final VoidCallback onReboot;
+  final VoidCallback? onShowManageHotspot;
+
+  const _DeviceInfoScreen({
+    required this.appState,
+    this.status,
+    this.hotspot,
+    this.network,
+    this.wifiNetworks,
+    required this.formatUptime,
+    required this.onRestartServices,
+    required this.onReboot,
+    this.onShowManageHotspot,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final device = appState.device;
+    final type = status?.type ?? device?.type ?? 'unknown';
+    final isHotspot = type == 'hotspot';
+
+    return Scaffold(
+      appBar: AppBar(title: const Text('Device Info')),
+      body: ListView(
+        padding: const EdgeInsets.all(16),
+        children: [
+          _StatusCard(
+            appState: appState,
+            status: status,
+            formatUptime: formatUptime,
+          ),
+          const SizedBox(height: 12),
+          if (network != null) ...[
+            _NetworkCard(network: network!),
+            const SizedBox(height: 12),
+          ],
+          if (wifiNetworks != null && device != null) ...[
+            _WifiCard(
+              networks: wifiNetworks!,
+              deviceHost: device.host,
+            ),
+            const SizedBox(height: 12),
+          ],
+          if (isHotspot && hotspot != null) ...[
+            _HotspotCard(
+              config: hotspot!,
+              onManage: onShowManageHotspot ?? () {},
+            ),
+            const SizedBox(height: 12),
+          ],
+          _QuickActionsCard(
+            onRestart: onRestartServices,
+            onReboot: onReboot,
+          ),
+        ],
+      ),
     );
   }
 }
@@ -476,13 +836,11 @@ class _TypeBadge extends StatelessWidget {
 
 class _HotspotCard extends StatelessWidget {
   final HotspotConfig config;
-  final int clientCount;
   final VoidCallback onManage;
-  const _HotspotCard({required this.config, required this.clientCount, required this.onManage});
+  const _HotspotCard({required this.config, required this.onManage});
 
   @override
   Widget build(BuildContext context) {
-    final colorScheme = Theme.of(context).colorScheme;
     return Card(
       child: Padding(
         padding: const EdgeInsets.all(16),
@@ -495,10 +853,6 @@ class _HotspotCard extends StatelessWidget {
                 const SizedBox(width: 8),
                 const Text('Hotspot', style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
                 const Spacer(),
-                Text(
-                  '$clientCount client${clientCount == 1 ? '' : 's'}',
-                  style: TextStyle(fontSize: 12, color: colorScheme.onSurfaceVariant),
-                ),
               ],
             ),
             const Divider(height: 20),
@@ -612,7 +966,7 @@ class _HotspotManageSheetState extends State<_HotspotManageSheet> {
 
   Future<void> _save() async {
     setState(() => _saving = true);
-    final api = OpenRigApiClient(host: widget.deviceHost, port: 7373);
+    final client = OpenRigHotspotClient(host: widget.deviceHost);
     final updated = HotspotConfig(
       dmr: DmrConfig(
         enabled: _dmrEnabled,
@@ -640,15 +994,8 @@ class _HotspotManageSheetState extends State<_HotspotManageSheet> {
       ),
     );
     try {
-      await api.updateHotspot(updated);
+      await client.saveHotspotConfig(updated);
       if (mounted) Navigator.of(context).pop();
-    } on OpenRigApiException catch (e) {
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Save failed: ${e.statusCode}')),
-        );
-        setState(() => _saving = false);
-      }
     } catch (e) {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
@@ -657,7 +1004,7 @@ class _HotspotManageSheetState extends State<_HotspotManageSheet> {
         setState(() => _saving = false);
       }
     } finally {
-      api.dispose();
+      client.dispose();
     }
   }
 
@@ -821,8 +1168,7 @@ class _RigCard extends StatelessWidget {
 class _QuickActionsCard extends StatelessWidget {
   final VoidCallback onRestart;
   final VoidCallback onReboot;
-  final VoidCallback onShutdown;
-  const _QuickActionsCard({required this.onRestart, required this.onReboot, required this.onShutdown});
+  const _QuickActionsCard({required this.onRestart, required this.onReboot});
 
   @override
   Widget build(BuildContext context) {
@@ -872,19 +1218,6 @@ class _QuickActionsCard extends StatelessWidget {
                     style: TextStyle(color: Colors.orange)),
                 style: OutlinedButton.styleFrom(
                   side: const BorderSide(color: Colors.orange),
-                ),
-              ),
-            ),
-            const SizedBox(height: 8),
-            SizedBox(
-              width: double.infinity,
-              child: OutlinedButton.icon(
-                onPressed: onShutdown,
-                icon: const Icon(Icons.power_off, color: Colors.red),
-                label: const Text('Shutdown Device',
-                    style: TextStyle(color: Colors.red)),
-                style: OutlinedButton.styleFrom(
-                  side: const BorderSide(color: Colors.red),
                 ),
               ),
             ),
@@ -1131,13 +1464,13 @@ class _WifiManageSheetState extends State<_WifiManageSheet> {
         builder: (ctx, setDialogState) {
           Future<void> scan() async {
             setDialogState(() => scanning = true);
-            final api = OpenRigApiClient(host: widget.deviceHost, port: 7373);
+            final client = OpenRigHotspotClient(host: widget.deviceHost);
             try {
-              scanned = await api.scanWifi();
+              scanned = await client.scanWifi();
             } catch (_) {
               scanned = [];
             } finally {
-              api.dispose();
+              client.dispose();
               if (ctx.mounted) setDialogState(() => scanning = false);
             }
           }
@@ -1231,17 +1564,10 @@ class _WifiManageSheetState extends State<_WifiManageSheet> {
 
   Future<void> _save() async {
     setState(() => _saving = true);
-    final api = OpenRigApiClient(host: widget.deviceHost, port: 7373);
+    final client = OpenRigHotspotClient(host: widget.deviceHost);
     try {
-      await api.updateWifi(_networks);
+      await client.updateWifi(_networks);
       if (mounted) Navigator.of(context).pop();
-    } on OpenRigApiException catch (e) {
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Save failed: ${e.statusCode}')),
-        );
-        setState(() => _saving = false);
-      }
     } catch (e) {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
@@ -1250,7 +1576,7 @@ class _WifiManageSheetState extends State<_WifiManageSheet> {
         setState(() => _saving = false);
       }
     } finally {
-      api.dispose();
+      client.dispose();
     }
   }
 
@@ -1318,6 +1644,199 @@ class _WifiManageSheetState extends State<_WifiManageSheet> {
           ],
         ),
       ),
+    );
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Inline device discovery (replaces the old standalone DiscoveryScreen)
+// ---------------------------------------------------------------------------
+
+class _DeviceDiscoveryView extends StatefulWidget {
+  final void Function(OpenRigDevice device) onDeviceSelected;
+  final void Function(String host) onManualConnect;
+
+  const _DeviceDiscoveryView({
+    required this.onDeviceSelected,
+    required this.onManualConnect,
+  });
+
+  @override
+  State<_DeviceDiscoveryView> createState() => _DeviceDiscoveryViewState();
+}
+
+class _DeviceDiscoveryViewState extends State<_DeviceDiscoveryView> {
+  NativeDiscovery? _discovery;
+  final _devices = <String, OpenRigDevice>{};
+  StreamSubscription<OpenRigDevice>? _foundSub;
+  StreamSubscription<String>? _lostSub;
+  bool _searching = true;
+  String? _error;
+
+  @override
+  void initState() {
+    super.initState();
+    _startDiscovery();
+  }
+
+  Future<void> _startDiscovery() async {
+    _discovery = NativeDiscovery();
+    _foundSub = _discovery!.onDeviceFound.listen((device) {
+      if (mounted) {
+        setState(() {
+          _devices[device.host] = device;
+          _searching = false;
+        });
+      }
+    });
+    _lostSub = _discovery!.onDeviceLost.listen((host) {
+      if (mounted) setState(() => _devices.remove(host));
+    });
+    try {
+      await _discovery!.start();
+    } catch (e) {
+      if (mounted) {
+        setState(() {
+          _error = e.toString();
+          _searching = false;
+        });
+      }
+    }
+  }
+
+  @override
+  void dispose() {
+    _foundSub?.cancel();
+    _lostSub?.cancel();
+    _discovery?.stop();
+    super.dispose();
+  }
+
+  void _showManualEntry() {
+    final controller = TextEditingController();
+    showDialog(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Manual Connection'),
+        content: TextField(
+          controller: controller,
+          decoration: const InputDecoration(
+            labelText: 'IP address or hostname',
+            hintText: '192.168.1.100',
+          ),
+          autofocus: true,
+          onSubmitted: (v) {
+            final trimmed = v.trim();
+            if (trimmed.isEmpty) return;
+            Navigator.of(ctx).pop();
+            widget.onManualConnect(trimmed);
+          },
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop(),
+            child: const Text('CANCEL'),
+          ),
+          TextButton(
+            onPressed: () {
+              final trimmed = controller.text.trim();
+              if (trimmed.isEmpty) return;
+              Navigator.of(ctx).pop();
+              widget.onManualConnect(trimmed);
+            },
+            child: const Text('CONNECT'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final colorScheme = Theme.of(context).colorScheme;
+    final deviceList = _devices.values.toList();
+
+    return Column(
+      children: [
+        if (_error != null)
+          Padding(
+            padding: const EdgeInsets.all(16),
+            child: Text(
+              'Auto-discovery unavailable on this device.\nUse manual connection below.',
+              style: TextStyle(color: colorScheme.onSurfaceVariant),
+              textAlign: TextAlign.center,
+            ),
+          ),
+        if (_searching && deviceList.isEmpty && _error == null)
+          const Expanded(
+            child: Center(
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  CircularProgressIndicator(),
+                  SizedBox(height: 16),
+                  Text('Searching for openRig devices...'),
+                ],
+              ),
+            ),
+          )
+        else
+          Expanded(
+            child: deviceList.isEmpty
+                ? Center(
+                    child: Column(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Icon(Icons.router_outlined,
+                            size: 64, color: colorScheme.onSurfaceVariant),
+                        const SizedBox(height: 16),
+                        const Text('No devices found'),
+                        const SizedBox(height: 24),
+                        FilledButton.icon(
+                          onPressed: _showManualEntry,
+                          icon: const Icon(Icons.edit),
+                          label: const Text('Connect Manually'),
+                        ),
+                      ],
+                    ),
+                  )
+                : ListView.builder(
+                    itemCount: deviceList.length,
+                    itemBuilder: (context, index) {
+                      final d = deviceList[index];
+                      return ListTile(
+                        leading: Icon(
+                          d.hasRigctld
+                              ? Icons.settings_remote
+                              : Icons.router,
+                          color: colorScheme.primary,
+                        ),
+                        title: Text(
+                          d.callsign.isNotEmpty ? d.callsign : d.name,
+                          style: const TextStyle(fontWeight: FontWeight.bold),
+                        ),
+                        subtitle: Text('${d.host}  \u2022  ${d.type}'),
+                        trailing: d.hasRigctld
+                            ? Chip(
+                                label: const Text('rigctld'),
+                                backgroundColor: colorScheme.primaryContainer,
+                              )
+                            : null,
+                        onTap: () => widget.onDeviceSelected(d),
+                      );
+                    },
+                  ),
+          ),
+        if (deviceList.isNotEmpty)
+          Padding(
+            padding: const EdgeInsets.only(bottom: 16),
+            child: TextButton.icon(
+              onPressed: _showManualEntry,
+              icon: const Icon(Icons.edit),
+              label: const Text('Connect Manually'),
+            ),
+          ),
+      ],
     );
   }
 }

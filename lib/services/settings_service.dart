@@ -8,6 +8,10 @@ class SettingsService {
   static const _keyClusterPort = 'cluster_port';
   static const _keyGridSquare = 'grid_square';
   static const _keyQrzApiKey = 'qrz_api_key';
+  static const _keyQrzXmlUser = 'qrz_xml_user';
+  static const _keyQrzXmlPass = 'qrz_xml_pass';
+  static const _keyAprsApiKey = 'aprs_api_key';
+  static const _keyAprsTrackedCallsigns = 'aprs_tracked_callsigns';
 
   late final SharedPreferences _prefs;
 
@@ -52,6 +56,31 @@ class SettingsService {
 
   Future<void> setQrzApiKey(String key) async {
     await _prefs.setString(_keyQrzApiKey, key);
+  }
+
+  // -- QRZ XML Lookup --
+
+  String get qrzXmlUser => _prefs.getString(_keyQrzXmlUser) ?? '';
+  String get qrzXmlPass => _prefs.getString(_keyQrzXmlPass) ?? '';
+
+  Future<void> setQrzXmlCredentials(String user, String pass) async {
+    await _prefs.setString(_keyQrzXmlUser, user);
+    await _prefs.setString(_keyQrzXmlPass, pass);
+  }
+
+  // -- APRS --
+
+  String get aprsApiKey => _prefs.getString(_keyAprsApiKey) ?? '';
+
+  Future<void> setAprsApiKey(String key) async {
+    await _prefs.setString(_keyAprsApiKey, key);
+  }
+
+  String get aprsTrackedCallsigns =>
+      _prefs.getString(_keyAprsTrackedCallsigns) ?? '';
+
+  Future<void> setAprsTrackedCallsigns(String callsigns) async {
+    await _prefs.setString(_keyAprsTrackedCallsigns, callsigns);
   }
 
   // -- DX Cluster node --

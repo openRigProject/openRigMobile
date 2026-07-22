@@ -1,5 +1,5 @@
 import 'package:flutter/material.dart';
-import 'package:openrig_core/openrig_core.dart' show QrzLogbookClient, QrzException, isValidGrid;
+import 'package:openrig_core/openrig_core.dart' show QrzLogbookClient, QrzException, QrzXmlClient, QrzXmlException, isValidGrid;
 import 'package:path_provider/path_provider.dart';
 
 import '../connection_state.dart';
@@ -86,6 +86,49 @@ class _SettingsScreenState extends State<SettingsScreen> {
           _QrzApiKeyTile(
             value: s?.qrzApiKey ?? '',
             onChanged: (v) => s?.setQrzApiKey(v.trim()),
+          ),
+
+          const SizedBox(height: 8),
+          _SectionHeader(title: 'QRZ Callsign Lookup'),
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 16),
+            child: Text(
+              'Requires a QRZ.com XML subscription (separate from the Logbook API key).',
+              style: TextStyle(fontSize: 12, color: colorScheme.onSurfaceVariant),
+            ),
+          ),
+          if (s != null)
+            _QrzXmlCredentialsTile(settings: s),
+
+          const Divider(),
+
+          // -- APRS --
+          _SectionHeader(title: 'APRS'),
+          _TextFieldTile(
+            label: 'APRS.fi API Key',
+            value: s?.aprsApiKey ?? '',
+            obscureText: true,
+            onChanged: (v) => s?.setAprsApiKey(v.trim()),
+          ),
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 16),
+            child: Text(
+              'Get a free key at aprs.fi',
+              style: TextStyle(fontSize: 12, color: colorScheme.onSurfaceVariant),
+            ),
+          ),
+          _TextFieldTile(
+            label: 'Tracked Callsigns',
+            value: s?.aprsTrackedCallsigns ?? '',
+            textCapitalization: TextCapitalization.characters,
+            onChanged: (v) => s?.setAprsTrackedCallsigns(v.trim()),
+          ),
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 16),
+            child: Text(
+              'Comma-separated list of callsigns to track on the APRS map.',
+              style: TextStyle(fontSize: 12, color: colorScheme.onSurfaceVariant),
+            ),
           ),
 
           const Divider(),
@@ -187,6 +230,7 @@ class _TextFieldTile extends StatefulWidget {
   final String value;
   final TextInputType? keyboardType;
   final TextCapitalization textCapitalization;
+  final bool obscureText;
   final ValueChanged<String>? onChanged;
 
   const _TextFieldTile({
@@ -194,6 +238,7 @@ class _TextFieldTile extends StatefulWidget {
     required this.value,
     this.keyboardType,
     this.textCapitalization = TextCapitalization.none,
+    this.obscureText = false,
     this.onChanged,
   });
 
@@ -225,6 +270,7 @@ class _TextFieldTileState extends State<_TextFieldTile> {
         decoration: InputDecoration(labelText: widget.label),
         keyboardType: widget.keyboardType,
         textCapitalization: widget.textCapitalization,
+        obscureText: widget.obscureText,
         onChanged: widget.onChanged,
         onSubmitted: widget.onChanged,
       ),
@@ -369,6 +415,114 @@ class _QrzApiKeyTileState extends State<_QrzApiKeyTile> {
                     child: CircularProgressIndicator(strokeWidth: 2),
                   )
                 : const Text('Verify'),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _QrzXmlCredentialsTile extends StatefulWidget {
+  final SettingsService settings;
+
+  const _QrzXmlCredentialsTile({required this.settings});
+
+  @override
+  State<_QrzXmlCredentialsTile> createState() => _QrzXmlCredentialsTileState();
+}
+
+class _QrzXmlCredentialsTileState extends State<_QrzXmlCredentialsTile> {
+  late final TextEditingController _userCtl;
+  late final TextEditingController _passCtl;
+  bool _verifying = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _userCtl = TextEditingController(text: widget.settings.qrzXmlUser);
+    _passCtl = TextEditingController(text: widget.settings.qrzXmlPass);
+  }
+
+  @override
+  void dispose() {
+    _userCtl.dispose();
+    _passCtl.dispose();
+    super.dispose();
+  }
+
+  void _save() {
+    widget.settings.setQrzXmlCredentials(
+      _userCtl.text.trim(),
+      _passCtl.text.trim(),
+    );
+  }
+
+  Future<void> _verify() async {
+    final user = _userCtl.text.trim();
+    final pass = _passCtl.text.trim();
+    if (user.isEmpty || pass.isEmpty) return;
+    _save();
+    setState(() => _verifying = true);
+    try {
+      final client = QrzXmlClient(username: user, password: pass);
+      final info = await client.lookupCallsign(user.toUpperCase());
+      client.dispose();
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Verified: ${info.call} — ${info.fullName}')),
+        );
+      }
+    } on QrzXmlException catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('QRZ XML error: ${e.message}')),
+        );
+      }
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('QRZ verify failed: $e')),
+        );
+      }
+    } finally {
+      if (mounted) setState(() => _verifying = false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
+      child: Column(
+        children: [
+          TextField(
+            controller: _userCtl,
+            decoration: const InputDecoration(labelText: 'QRZ Username'),
+            textCapitalization: TextCapitalization.characters,
+            onChanged: (_) => _save(),
+          ),
+          const SizedBox(height: 8),
+          Row(
+            children: [
+              Expanded(
+                child: TextField(
+                  controller: _passCtl,
+                  decoration: const InputDecoration(labelText: 'QRZ Password'),
+                  obscureText: true,
+                  onChanged: (_) => _save(),
+                ),
+              ),
+              const SizedBox(width: 8),
+              FilledButton.tonal(
+                onPressed: _verifying ? null : _verify,
+                child: _verifying
+                    ? const SizedBox(
+                        width: 16, height: 16,
+                        child: CircularProgressIndicator(strokeWidth: 2),
+                      )
+                    : const Text('Verify'),
+              ),
+            ],
           ),
         ],
       ),

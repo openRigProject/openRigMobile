@@ -13,7 +13,7 @@ class RigSettingsScreen extends StatefulWidget {
 }
 
 class _RigSettingsScreenState extends State<RigSettingsScreen> {
-  OpenRigApiClient? _api;
+  OpenRigHotspotClient? _api;
   bool _loading = true;
   String? _error;
   bool _saving = false;
@@ -53,7 +53,7 @@ class _RigSettingsScreenState extends State<RigSettingsScreen> {
       });
       return;
     }
-    _api = OpenRigApiClient(host: device.host, port: 7373);
+    _api = OpenRigHotspotClient(host: device.host);
     _loadConfig();
   }
 

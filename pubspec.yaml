@@ -13,6 +13,9 @@ dependencies:
     path: ../openrig_core
   path_provider: ^2.1.5
   shared_preferences: ^2.5.5
+  flutter_map: ^7.0.0
+  latlong2: ^0.9.0
+  bonsoir: ^7.1.4
 
 dev_dependencies:
   flutter_lints: ^6.0.0

@@ -71,6 +71,14 @@ class AppConnectionState with ChangeNotifier {
     }
   }
 
+  /// Disconnect from the current device and clear saved settings.
+  Future<void> disconnectDevice() async {
+    await disconnectRig();
+    _device = null;
+    settings?.clearDevice();
+    notifyListeners();
+  }
+
   /// Connect to a device by manual IP/hostname.
   void setManualDevice(String host) {
     _device = OpenRigDevice(

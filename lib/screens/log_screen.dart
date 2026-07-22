@@ -13,6 +13,8 @@ class QsoPreFill {
   final DateTime? timeOn;
   final String? rstSent;
   final String? rstRcvd;
+  final String? potaRef;
+  final String? sotaRef;
 
   const QsoPreFill({
     this.callsign,
@@ -21,6 +23,8 @@ class QsoPreFill {
     this.timeOn,
     this.rstSent,
     this.rstRcvd,
+    this.potaRef,
+    this.sotaRef,
   });
 }
 
@@ -100,26 +104,6 @@ class LogScreenState extends State<LogScreen> {
     }
   }
 
-  void _uploadToQrz(QsoRecord record) {
-    final key = widget.appState.settings?.qrzApiKey ?? '';
-    if (key.isEmpty) return;
-    final client = QrzLogbookClient(apiKey: key);
-    client.insertQso(record).then((_) {
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('Logged to QRZ \u2713')),
-        );
-      }
-    }).catchError((Object e) {
-      if (mounted) {
-        final reason = e is QrzException ? e.message : e.toString();
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('QRZ upload failed: $reason')),
-        );
-      }
-    }).whenComplete(() => client.dispose());
-  }
-
   List<QsoRecord> get _displayedQsos {
     if (_searchQuery.isEmpty) return _qsos;
     return LogSearch.filter(_qsos, callsign: _searchQuery);
@@ -171,7 +155,6 @@ class LogScreenState extends State<LogScreen> {
           await AdifLog.appendRecord(path, record);
           _dupeChecker?.addQso(record);
           _loadLog();
-          _uploadToQrz(record);
         },
       ),
     );
@@ -429,10 +412,12 @@ class _NewQsoDialogState extends State<_NewQsoDialog> {
   final _sotaCtl = TextEditingController();
   final _myPotaCtl = TextEditingController();
   final _potaCtl = TextEditingController();
-
   @override
   void initState() {
     super.initState();
+    final preFill = widget.preFill;
+    if (preFill?.potaRef != null) _potaCtl.text = preFill!.potaRef!;
+    if (preFill?.sotaRef != null) _sotaCtl.text = preFill!.sotaRef!;
     widget.callCtrl.addListener(_onCallChanged);
     widget.freqCtrl.addListener(_onCallChanged);
     widget.modeCtrl.addListener(_onCallChanged);
@@ -545,6 +530,7 @@ class _NewQsoDialogState extends State<_NewQsoDialog> {
               title: const Text('POTA / SOTA', style: TextStyle(fontSize: 14)),
               tilePadding: EdgeInsets.zero,
               childrenPadding: EdgeInsets.zero,
+              initiallyExpanded: _potaCtl.text.isNotEmpty || _sotaCtl.text.isNotEmpty,
               children: [
                 TextField(
                   controller: _mySotaCtl,
