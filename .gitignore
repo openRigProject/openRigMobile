@@ -10,4 +10,11 @@ build/
 android/.gradle/
 android/local.properties
 ios/Pods/
+ios/Podfile.lock
 ios/.symlinks/
+
+# macOS
+.DS_Store
+
+# IDE / tools
+devtools_options.yaml
