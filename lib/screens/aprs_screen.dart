@@ -1,8 +1,7 @@
 import 'dart:async';
 
 import 'package:flutter/material.dart';
-import 'package:flutter_map/flutter_map.dart';
-import 'package:latlong2/latlong.dart';
+import 'package:apple_maps_flutter/apple_maps_flutter.dart' as apple;
 import 'package:openrig_core/openrig_core.dart';
 
 import '../connection_state.dart';
@@ -13,7 +12,6 @@ import '../services/aprs_carplay_channel.dart' show AprsCarPlayChannel;
 List<String> _prefixesForArea(double lat, double lon) {
   // North America
   if (lat >= 24 && lat <= 50 && lon >= -130 && lon <= -60) {
-    // US call districts (rough geographic mapping)
     if (lat >= 40 && lon >= -75) return ['W1*', 'W2*', 'K1*', 'K2*'];
     if (lat >= 35 && lon >= -85) return ['W3*', 'W4*', 'K3*', 'K4*'];
     if (lat >= 35 && lon >= -100) return ['W4*', 'W5*', 'K4*', 'K5*'];
@@ -65,11 +63,12 @@ class _AprsScreenState extends State<AprsScreen>
   AprsFiClient? _client;
   Timer? _pollTimer;
   Timer? _browseDebounce;
-  final _mapController = MapController();
+  apple.AppleMapController? _mapController;
   final _searchCtrl = TextEditingController();
   bool _loading = false;
-  bool _browsing = false; // true when showing area browse results
-  LatLng? _lastBrowseCenter;
+  bool _browsing = false;
+  apple.LatLng? _lastBrowseCenter;
+  apple.CameraPosition? _lastCameraPosition;
   AprsCarPlayChannel get _carPlayChannel => widget.carPlayChannel;
 
   @override
@@ -116,7 +115,6 @@ class _AprsScreenState extends State<AprsScreen>
     _browseDebounce?.cancel();
     _client?.dispose();
     _carPlayChannel.onCarPlayMapMoved = null;
-    _mapController.dispose();
     _searchCtrl.dispose();
     super.dispose();
   }
@@ -133,6 +131,7 @@ class _AprsScreenState extends State<AprsScreen>
           _loading = false;
         });
         _carPlayChannel.updateStations(stations);
+        _fitStationsOnMap(stations);
       }
     } catch (e) {
       if (mounted) {
@@ -144,50 +143,76 @@ class _AprsScreenState extends State<AprsScreen>
     }
   }
 
-  void _onMapEvent(MapEvent event) {
-    // Sync center to CarPlay on move-end events
-    if (event is MapEventMoveEnd ||
-        event is MapEventFlingAnimationEnd ||
-        event is MapEventDoubleTapZoomEnd ||
-        event is MapEventScrollWheelZoom) {
-      if (!_syncingFromCarPlay) {
-        try {
-          final c = _mapController.camera;
-          _carPlayChannel.updateMapCenter(
-              c.center.latitude, c.center.longitude, c.zoom);
-        } catch (_) {}
+  void _fitStationsOnMap(List<AprsStation> stations) {
+    if (stations.isEmpty || _mapController == null) return;
+    if (stations.length == 1) {
+      _mapController!.moveCamera(apple.CameraUpdate.newLatLngZoom(
+        apple.LatLng(stations.first.lat, stations.first.lng),
+        10,
+      ));
+    } else {
+      double minLat = 90, maxLat = -90, minLon = 180, maxLon = -180;
+      for (final s in stations) {
+        if (s.lat < minLat) minLat = s.lat;
+        if (s.lat > maxLat) maxLat = s.lat;
+        if (s.lng < minLon) minLon = s.lng;
+        if (s.lng > maxLon) maxLon = s.lng;
       }
-
-      // Area browse on move
-      if (_isBrowseMode && _client != null) {
-        _browseDebounce?.cancel();
-        _browseDebounce = Timer(const Duration(seconds: 2), _browseArea);
-      }
+      _mapController!.moveCamera(apple.CameraUpdate.newLatLngBounds(
+        apple.LatLngBounds(
+          southwest: apple.LatLng(minLat, minLon),
+          northeast: apple.LatLng(maxLat, maxLon),
+        ),
+        40,
+      ));
     }
   }
 
+  void _onCameraMove(apple.CameraPosition position) {
+    _lastCameraPosition = position;
+  }
+
+  void _onCameraIdle() {
+    if (_syncingFromCarPlay) return;
+    _syncCameraToCarPlay();
+    if (_isBrowseMode && _client != null) {
+      _browseDebounce?.cancel();
+      _browseDebounce = Timer(const Duration(seconds: 2), _browseArea);
+    }
+  }
+
+  void _syncCameraToCarPlay() {
+    final pos = _lastCameraPosition;
+    if (pos == null) return;
+    _carPlayChannel.updateMapCenter(
+      pos.target.latitude,
+      pos.target.longitude,
+      pos.zoom,
+    );
+  }
+
   void _onCarPlayMapMoved(double lat, double lon, double zoom) {
-    if (!mounted) return;
+    if (!mounted || _mapController == null) return;
     _syncingFromCarPlay = true;
-    try {
-      // move() is synchronous — any resulting map events fire immediately
-      // while _syncingFromCarPlay is still true.
-      _mapController.move(LatLng(lat, lon), zoom);
-    } catch (_) {}
-    _syncingFromCarPlay = false;
+    final target = apple.LatLng(lat, lon);
+    _lastCameraPosition = apple.CameraPosition(target: target, zoom: zoom);
+    _mapController!.moveCamera(
+      apple.CameraUpdate.newLatLngZoom(target, zoom),
+    );
+    Future.delayed(const Duration(milliseconds: 500), () {
+      _syncingFromCarPlay = false;
+    });
   }
 
   Future<void> _browseArea() async {
     if (_client == null || !_isBrowseMode) return;
 
-    final LatLng center;
-    try {
-      center = _mapController.camera.center;
-    } catch (_) {
-      return;
-    }
+    final pos = _lastCameraPosition;
+    if (pos == null) return;
 
-    // Skip if center hasn't moved significantly (>0.5 degrees)
+    final center = pos.target;
+
+    // Skip if center hasn't moved significantly
     if (_lastBrowseCenter != null) {
       final dLat = (center.latitude - _lastBrowseCenter!.latitude).abs();
       final dLon = (center.longitude - _lastBrowseCenter!.longitude).abs();
@@ -195,21 +220,24 @@ class _AprsScreenState extends State<AprsScreen>
     }
     _lastBrowseCenter = center;
 
+    // Estimate visible bounds from zoom level (~degrees per zoom level)
+    final latSpan = 180.0 / (1 << pos.zoom.round().clamp(1, 20));
+    final lonSpan = 360.0 / (1 << pos.zoom.round().clamp(1, 20));
+
     final prefixes = _prefixesForArea(center.latitude, center.longitude);
     setState(() => _loading = true);
     try {
       final stations = await _client!.getLocations(prefixes);
       if (!mounted || !_isBrowseMode) return;
 
-      // Filter to stations within the visible map bounds (with padding)
-      final bounds = _mapController.camera.visibleBounds;
-      final padLat = (bounds.north - bounds.south) * 0.2;
-      final padLon = (bounds.east - bounds.west) * 0.2;
+      // Filter to stations within the estimated visible bounds (with padding)
+      final padLat = latSpan * 0.7;
+      final padLon = lonSpan * 0.7;
       final filtered = stations.where((s) {
-        return s.lat >= bounds.south - padLat &&
-            s.lat <= bounds.north + padLat &&
-            s.lng >= bounds.west - padLon &&
-            s.lng <= bounds.east + padLon;
+        return s.lat >= center.latitude - padLat &&
+            s.lat <= center.latitude + padLat &&
+            s.lng >= center.longitude - padLon &&
+            s.lng <= center.longitude + padLon;
       }).toList();
 
       setState(() {
@@ -249,7 +277,6 @@ class _AprsScreenState extends State<AprsScreen>
     });
     widget.appState.settings
         ?.setAprsTrackedCallsigns(_trackedCallsigns.join(','));
-    // If no more tracked callsigns, switch to browse mode
     if (_isBrowseMode) {
       _browseArea();
     }
@@ -258,8 +285,10 @@ class _AprsScreenState extends State<AprsScreen>
   void _goToMyLocation() {
     final grid = widget.appState.settings?.gridSquare ?? '';
     final pos = gridToLatLon(grid);
-    if (pos != null) {
-      _mapController.move(LatLng(pos.lat, pos.lon), 10);
+    if (pos != null && _mapController != null) {
+      _mapController!.moveCamera(
+        apple.CameraUpdate.newLatLngZoom(apple.LatLng(pos.lat, pos.lon), 10),
+      );
     }
   }
 
@@ -347,6 +376,34 @@ class _AprsScreenState extends State<AprsScreen>
     return '${diff.inDays}d ago';
   }
 
+  // Map station index to a lookup for tap handling
+  final Map<String, AprsStation> _stationMap = {};
+
+  Set<apple.Annotation> _buildAnnotations() {
+    _stationMap.clear();
+    final colorScheme = Theme.of(context).colorScheme;
+    final browseHue = HSLColor.fromColor(colorScheme.tertiary).hue;
+    final trackHue = HSLColor.fromColor(colorScheme.primary).hue;
+
+    final hue = _browsing ? browseHue : trackHue;
+    return _stations.map((s) {
+      final id = '${s.callsign}_${s.lat}_${s.lng}';
+      _stationMap[id] = s;
+      return apple.Annotation(
+        annotationId: apple.AnnotationId(id),
+        position: apple.LatLng(s.lat, s.lng),
+        infoWindow: apple.InfoWindow(
+          title: s.callsign,
+          snippet: s.comment.isNotEmpty ? s.comment : _formatRelativeTime(s.lastTime),
+        ),
+        icon: apple.BitmapDescriptor.markerAnnotationWithHue(hue.toDouble()),
+        onTap: () {
+          _showStationDetail(s);
+        },
+      );
+    }).toSet();
+  }
+
   @override
   Widget build(BuildContext context) {
     super.build(context);
@@ -378,47 +435,6 @@ class _AprsScreenState extends State<AprsScreen>
         ),
       );
     }
-
-    final markers = _stations.map((s) {
-      final isBrowseMarker = _browsing;
-      return Marker(
-        point: LatLng(s.lat, s.lng),
-        width: 80,
-        height: 40,
-        child: GestureDetector(
-          onTap: () => _showStationDetail(s),
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              Container(
-                width: 12,
-                height: 12,
-                decoration: BoxDecoration(
-                  color: isBrowseMarker
-                      ? colorScheme.tertiary
-                      : colorScheme.primary,
-                  shape: BoxShape.circle,
-                  border: Border.all(color: Colors.white, width: 1.5),
-                ),
-              ),
-              const SizedBox(height: 2),
-              Text(
-                s.callsign,
-                style: const TextStyle(
-                  fontSize: 10,
-                  fontWeight: FontWeight.bold,
-                  color: Colors.white,
-                  shadows: [
-                    Shadow(blurRadius: 2, color: Colors.black),
-                    Shadow(blurRadius: 4, color: Colors.black),
-                  ],
-                ),
-              ),
-            ],
-          ),
-        ),
-      );
-    }).toList();
 
     return Scaffold(
       body: Column(
@@ -514,33 +530,21 @@ class _AprsScreenState extends State<AprsScreen>
 
           // Map
           Expanded(
-            child: FlutterMap(
-              mapController: _mapController,
-              options: MapOptions(
-                initialCenter: const LatLng(39.8283, -98.5795),
-                initialZoom: 4,
-                interactionOptions: const InteractionOptions(
-                  flags: InteractiveFlag.all,
-                ),
-                onMapEvent: _onMapEvent,
-                onMapReady: () {
-                  if (_isBrowseMode) _browseArea();
-                },
+            child: apple.AppleMap(
+              initialCameraPosition: const apple.CameraPosition(
+                target: apple.LatLng(39.8283, -98.5795),
+                zoom: 4,
               ),
-              children: [
-                TileLayer(
-                  urlTemplate:
-                      'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
-                  userAgentPackageName: 'com.openrig.mobile',
-                ),
-                const RichAttributionWidget(
-                  attributions: [
-                    TextSourceAttribution('OpenStreetMap contributors'),
-                    TextSourceAttribution('Station data from aprs.fi'),
-                  ],
-                ),
-                MarkerLayer(markers: markers),
-              ],
+              annotations: _buildAnnotations(),
+              myLocationEnabled: false,
+              onMapCreated: (controller) {
+                _mapController = controller;
+                if (_isBrowseMode) {
+                  Future.delayed(const Duration(milliseconds: 500), _browseArea);
+                }
+              },
+              onCameraMove: _onCameraMove,
+              onCameraIdle: _onCameraIdle,
             ),
           ),
         ],

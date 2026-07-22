@@ -1,8 +1,8 @@
+import 'dart:io' show Platform;
 import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
-import 'package:flutter_map/flutter_map.dart';
-import 'package:latlong2/latlong.dart';
+import 'package:apple_maps_flutter/apple_maps_flutter.dart' as apple;
 
 class MapLocation {
   final double lat;
@@ -12,7 +12,8 @@ class MapLocation {
       {required this.lat, required this.lon, required this.callsign});
 }
 
-/// Shows an OpenStreetMap view centered on the station being looked up.
+/// Shows a native Apple Maps view (iOS) centered on the station being looked up.
+/// Falls back to a placeholder on non-iOS platforms.
 class MapWidget extends StatefulWidget {
   final ValueNotifier<MapLocation?> location;
 
@@ -24,15 +25,15 @@ class MapWidget extends StatefulWidget {
 
 class _MapWidgetState extends State<MapWidget>
     with SingleTickerProviderStateMixin {
-  final _mapController = MapController();
+  apple.AppleMapController? _mapController;
   late final AnimationController _animController;
   Animation<double>? _latAnim;
   Animation<double>? _lonAnim;
 
   // Tracks the current map center for animation start point.
-  LatLng? _currentCenter;
-  // Separate state for marker + label so FlutterMap isn't rebuilt from scratch.
-  LatLng? _markerPos;
+  apple.LatLng? _currentCenter;
+  // Marker state
+  apple.LatLng? _markerPos;
   String _markerLabel = '';
   // Zoom range for current fly-to animation.
   double _animStartZoom = 6.0;
@@ -53,34 +54,31 @@ class _MapWidgetState extends State<MapWidget>
   void dispose() {
     _animController.dispose();
     widget.location.removeListener(_onLocationChanged);
-    _mapController.dispose();
     super.dispose();
   }
 
   void _onAnimTick() {
     if (_latAnim == null || _lonAnim == null) return;
-    final t = _animController.value; // 0→1
+    final t = _animController.value;
 
-    // Zoom arcs parabolically: starts at _animStartZoom, dips to _animMinZoom
-    // at t=0.5, then recovers to _animEndZoom.
+    // Parabolic zoom arc: dips to _animMinZoom at t=0.5, recovers to _animEndZoom
     final zoomDip = (_animStartZoom - _animMinZoom) * math.sin(math.pi * t);
     final zoom = _animStartZoom - zoomDip +
         (_animEndZoom - _animStartZoom) * t;
 
-    final pos = LatLng(_latAnim!.value, _lonAnim!.value);
+    final pos = apple.LatLng(_latAnim!.value, _lonAnim!.value);
     _currentCenter = pos;
-    try {
-      _mapController.move(pos, zoom);
-    } catch (_) {
-      // Controller not yet attached (first frame); ignore.
-    }
+
+    _mapController?.moveCamera(
+      apple.CameraUpdate.newLatLngZoom(pos, zoom),
+    );
   }
 
   void _onLocationChanged() {
     final loc = widget.location.value;
     if (loc == null) return;
 
-    final target = LatLng(loc.lat, loc.lon);
+    final target = apple.LatLng(loc.lat, loc.lon);
     setState(() {
       _markerPos = target;
       _markerLabel = loc.callsign;
@@ -88,13 +86,16 @@ class _MapWidgetState extends State<MapWidget>
 
     final from = _currentCenter;
     if (from == null) {
-      // First location — FlutterMap will use initialCenter; no animation needed.
       _currentCenter = target;
+      _mapController?.moveCamera(
+        apple.CameraUpdate.newLatLngZoom(target, 6),
+      );
       return;
     }
 
-    // Distance in km determines how far to zoom out and how long to animate.
-    final distKm = const Distance().as(LengthUnit.Kilometer, from, target);
+    // Distance in km (Haversine) determines zoom arc
+    final distKm = _haversineKm(
+        from.latitude, from.longitude, target.latitude, target.longitude);
 
     double minZoom;
     Duration duration;
@@ -118,14 +119,7 @@ class _MapWidgetState extends State<MapWidget>
       duration = const Duration(milliseconds: 700);
     }
 
-    double currentZoom;
-    try {
-      currentZoom = _mapController.camera.zoom;
-    } catch (_) {
-      currentZoom = 6.0;
-    }
-
-    _animStartZoom = currentZoom;
+    _animStartZoom = 6.0;
     _animEndZoom = 6.0;
     _animMinZoom = minZoom;
     _animController.duration = duration;
@@ -137,8 +131,25 @@ class _MapWidgetState extends State<MapWidget>
     _animController.forward(from: 0);
   }
 
+  double _haversineKm(double lat1, double lon1, double lat2, double lon2) {
+    const r = 6371.0;
+    final dLat = (lat2 - lat1) * math.pi / 180;
+    final dLon = (lon2 - lon1) * math.pi / 180;
+    final a = math.sin(dLat / 2) * math.sin(dLat / 2) +
+        math.cos(lat1 * math.pi / 180) * math.cos(lat2 * math.pi / 180) *
+        math.sin(dLon / 2) * math.sin(dLon / 2);
+    return r * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a));
+  }
+
   @override
   Widget build(BuildContext context) {
+    if (!Platform.isIOS) {
+      return Container(
+        color: const Color(0xFF1a1a1a),
+        child: const Center(child: Text('Apple Maps requires iOS')),
+      );
+    }
+
     if (_markerPos == null) {
       return Container(
         color: const Color(0xFF1a1a1a),
@@ -159,34 +170,26 @@ class _MapWidgetState extends State<MapWidget>
       );
     }
 
+    final annotations = <apple.Annotation>{
+      apple.Annotation(
+        annotationId: apple.AnnotationId('station'),
+        position: _markerPos!,
+        infoWindow: apple.InfoWindow(title: _markerLabel),
+      ),
+    };
+
     return Stack(
       children: [
-        FlutterMap(
-          mapController: _mapController,
-          options: MapOptions(
-            initialCenter: _markerPos!,
-            initialZoom: 6,
-            interactionOptions: const InteractionOptions(
-              flags: InteractiveFlag.all,
-            ),
+        apple.AppleMap(
+          initialCameraPosition: apple.CameraPosition(
+            target: _markerPos!,
+            zoom: 6,
           ),
-          children: [
-            TileLayer(
-              urlTemplate: 'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
-              userAgentPackageName: 'com.openrig.mobile',
-            ),
-            MarkerLayer(
-              markers: [
-                Marker(
-                  point: _markerPos!,
-                  width: 32,
-                  height: 32,
-                  child: const Icon(Icons.location_on,
-                      color: Colors.red, size: 32),
-                ),
-              ],
-            ),
-          ],
+          annotations: annotations,
+          myLocationEnabled: false,
+          onMapCreated: (controller) {
+            _mapController = controller;
+          },
         ),
         // Callsign overlay
         Positioned(
@@ -195,8 +198,7 @@ class _MapWidgetState extends State<MapWidget>
           right: 0,
           child: Center(
             child: Container(
-              padding:
-                  const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
               decoration: BoxDecoration(
                 color: Colors.black.withAlpha(160),
                 borderRadius: BorderRadius.circular(4),

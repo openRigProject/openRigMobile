@@ -3,6 +3,11 @@ import CoreLocation
 import Flutter
 import MapKit
 
+enum CarPlayMapMode {
+    case aprs
+    case lastHeard
+}
+
 @available(iOS 14.0, *)
 class CarPlaySceneDelegate: UIResponder, CPTemplateApplicationSceneDelegate {
     var interfaceController: CPInterfaceController?
@@ -11,6 +16,8 @@ class CarPlaySceneDelegate: UIResponder, CPTemplateApplicationSceneDelegate {
     private var methodChannel: FlutterMethodChannel?
     private var refreshTimer: Timer?
     private var stations: [[String: Any]] = []
+    private var lastHeardData: [String: Any]?
+    private var mapMode: CarPlayMapMode = .aprs
     private let locationManager = CLLocationManager()
 
     func templateApplicationScene(
@@ -46,9 +53,28 @@ class CarPlaySceneDelegate: UIResponder, CPTemplateApplicationSceneDelegate {
                 case "updateStations":
                     if let data = call.arguments as? [[String: Any]] {
                         self?.stations = data
-                        self?.mapViewController?.updateStations(data)
-                        self?.updateMapTemplate()
+                        if self?.mapMode == .aprs {
+                            self?.mapViewController?.updateStations(data)
+                        }
+                        self?.updateNavButtons()
                     }
+                    result(nil)
+                case "updateLastHeard":
+                    if let data = call.arguments as? [String: Any] {
+                        self?.lastHeardData = data
+                        if self?.mapMode == .lastHeard {
+                            self?.showLastHeardOnMap(data)
+                        }
+                        self?.updateNavButtons()
+                    }
+                    result(nil)
+                case "clearLastHeard":
+                    self?.lastHeardData = nil
+                    if self?.mapMode == .lastHeard {
+                        self?.mapViewController?.updateStations([])
+                        self?.mapViewController?.hideQsoOverlay()
+                    }
+                    self?.updateNavButtons()
                     result(nil)
                 case "updateMapCenter":
                     if let args = call.arguments as? [String: Any],
@@ -76,6 +102,7 @@ class CarPlaySceneDelegate: UIResponder, CPTemplateApplicationSceneDelegate {
 
         // Fetch initial station data and start periodic refresh
         refreshStations()
+        fetchLastHeard()
         refreshTimer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in
             self?.refreshStations()
         }
@@ -119,13 +146,109 @@ class CarPlaySceneDelegate: UIResponder, CPTemplateApplicationSceneDelegate {
 
         mapTemplate.mapButtons = [zoomIn, zoomOut, recenter]
 
-        // Station list button in the navigation bar
-        let listButton = CPBarButton(title: "Stations") { [weak self] _ in
-            self?.showStationList()
-        }
-        mapTemplate.leadingNavigationBarButtons = [listButton]
+        // Nav bar buttons
+        updateNavButtons(mapTemplate: mapTemplate)
 
         return mapTemplate
+    }
+
+    private func updateNavButtons(mapTemplate: CPMapTemplate? = nil) {
+        guard let template = mapTemplate ?? (interfaceController?.rootTemplate as? CPMapTemplate) else { return }
+
+        // Leading: context button (station list or last heard info)
+        let leadingTitle: String
+        switch mapMode {
+        case .aprs:
+            let count = stations.count
+            leadingTitle = count > 0 ? "\(count) station\(count == 1 ? "" : "s")" : "Stations"
+        case .lastHeard:
+            leadingTitle = lastHeardData?["callsign"] as? String ?? "Last Heard"
+        }
+        let listButton = CPBarButton(title: leadingTitle) { [weak self] _ in
+            switch self?.mapMode {
+            case .aprs:
+                self?.showStationList()
+            case .lastHeard:
+                if let data = self?.lastHeardData {
+                    self?.showLastHeardDetail(data)
+                }
+            case .none:
+                break
+            }
+        }
+        template.leadingNavigationBarButtons = [listButton]
+
+        // Trailing: mode toggle
+        let toggleTitle = mapMode == .aprs ? "Hotspot" : "APRS"
+        let toggleButton = CPBarButton(title: toggleTitle) { [weak self] _ in
+            self?.toggleMapMode()
+        }
+        template.trailingNavigationBarButtons = [toggleButton]
+    }
+
+    private func toggleMapMode() {
+        switch mapMode {
+        case .aprs:
+            mapMode = .lastHeard
+            if let data = lastHeardData {
+                showLastHeardOnMap(data)
+            } else {
+                mapViewController?.updateStations([])
+                mapViewController?.hideQsoOverlay()
+            }
+        case .lastHeard:
+            mapMode = .aprs
+            mapViewController?.hideQsoOverlay()
+            mapViewController?.updateStations(stations)
+        }
+        updateNavButtons()
+    }
+
+    private func showLastHeardOnMap(_ data: [String: Any]) {
+        let callsign = data["callsign"] as? String ?? ""
+        let lat = data["lat"] as? Double ?? 0.0
+        let lon = data["lon"] as? Double ?? 0.0
+        let mode = data["mode"] as? String ?? ""
+        let info = data["info"] as? String ?? ""
+        let duration = data["duration"] as? String ?? ""
+        let isActive = data["isActive"] as? Bool ?? false
+        let name = data["name"] as? String ?? ""
+        let location = data["location"] as? String ?? ""
+        let grid = data["grid"] as? String ?? ""
+        let freqMhz = data["freqMhz"] as? Double ?? 0.0
+
+        // Update map marker (autoZoom false — flyTo handles camera)
+        if lat != 0 || lon != 0 {
+            let stationData: [String: Any] = [
+                "callsign": callsign,
+                "lat": lat,
+                "lon": lon,
+                "comment": "\(mode) \(info)".trimmingCharacters(in: .whitespaces),
+            ]
+            mapViewController?.updateStations([stationData], autoZoom: false)
+            mapViewController?.flyTo(lat: lat, lon: lon)
+        } else {
+            mapViewController?.updateStations([])
+        }
+
+        // Build overlay text
+        var lines: [String] = []
+        lines.append("\(callsign)  \(mode)")
+        if !info.isEmpty { lines[0] += "  \(info)" }
+        if !name.isEmpty { lines.append(name) }
+        if !location.isEmpty { lines.append(location) }
+
+        var detailParts: [String] = []
+        if freqMhz > 0 { detailParts.append(String(format: "%.4f MHz", freqMhz)) }
+        if !grid.isEmpty { detailParts.append(grid) }
+        if isActive {
+            detailParts.append("LIVE")
+        } else if !duration.isEmpty {
+            detailParts.append(duration)
+        }
+        if !detailParts.isEmpty { lines.append(detailParts.joined(separator: "  •  ")) }
+
+        mapViewController?.showQsoOverlay(lines: lines, isActive: isActive)
     }
 
     private func centerOnCurrentLocation() {
@@ -141,20 +264,7 @@ class CarPlaySceneDelegate: UIResponder, CPTemplateApplicationSceneDelegate {
         }
     }
 
-    private func updateMapTemplate() {
-        if let mapTemplate = interfaceController?.rootTemplate as? CPMapTemplate {
-            let count = stations.count
-            if count > 0 {
-                let subtitle = "\(count) station\(count == 1 ? "" : "s")"
-                let listButton = CPBarButton(title: subtitle) { [weak self] _ in
-                    self?.showStationList()
-                }
-                mapTemplate.leadingNavigationBarButtons = [listButton]
-            }
-        }
-    }
-
-    // MARK: - Station List
+    // MARK: - Station List (APRS mode)
 
     private func showStationList() {
         if stations.isEmpty {
@@ -202,7 +312,7 @@ class CarPlaySceneDelegate: UIResponder, CPTemplateApplicationSceneDelegate {
         interfaceController?.pushTemplate(template, animated: true, completion: nil)
     }
 
-    // MARK: - Station Detail
+    // MARK: - Station Detail (APRS mode)
 
     private func showStationDetail(_ station: [String: Any]) {
         let callsign = station["callsign"] as? String ?? "Unknown"
@@ -237,14 +347,69 @@ class CarPlaySceneDelegate: UIResponder, CPTemplateApplicationSceneDelegate {
         interfaceController?.pushTemplate(template, animated: true, completion: nil)
     }
 
+    // MARK: - Last Heard Detail
+
+    private func showLastHeardDetail(_ data: [String: Any]) {
+        let callsign = data["callsign"] as? String ?? "Unknown"
+        let mode = data["mode"] as? String ?? ""
+        let info = data["info"] as? String ?? ""
+        let duration = data["duration"] as? String ?? ""
+        let isActive = data["isActive"] as? Bool ?? false
+        let name = data["name"] as? String ?? ""
+        let location = data["location"] as? String ?? ""
+        let grid = data["grid"] as? String ?? ""
+        let freqMhz = data["freqMhz"] as? Double ?? 0.0
+
+        var infoItems: [CPInformationItem] = []
+        infoItems.append(CPInformationItem(title: "Mode", detail: mode))
+        if !info.isEmpty {
+            infoItems.append(CPInformationItem(title: "Info", detail: info))
+        }
+        if !name.isEmpty {
+            infoItems.append(CPInformationItem(title: "Name", detail: name))
+        }
+        if !location.isEmpty {
+            infoItems.append(CPInformationItem(title: "Location", detail: location))
+        }
+        if !grid.isEmpty {
+            infoItems.append(CPInformationItem(title: "Grid", detail: grid))
+        }
+        if freqMhz > 0 {
+            infoItems.append(CPInformationItem(title: "Frequency", detail: String(format: "%.4f MHz", freqMhz)))
+        }
+        let status = isActive ? "LIVE" : (!duration.isEmpty ? duration : "—")
+        infoItems.append(CPInformationItem(title: "Status", detail: status))
+
+        let template = CPInformationTemplate(
+            title: callsign,
+            layout: .leading,
+            items: infoItems,
+            actions: []
+        )
+
+        interfaceController?.pushTemplate(template, animated: true, completion: nil)
+    }
+
     // MARK: - Data
 
     private func refreshStations() {
         methodChannel?.invokeMethod("getAprsStations", arguments: nil) { [weak self] result in
             guard let stations = result as? [[String: Any]] else { return }
             self?.stations = stations
-            self?.mapViewController?.updateStations(stations)
-            self?.updateMapTemplate()
+            if self?.mapMode == .aprs {
+                self?.mapViewController?.updateStations(stations)
+            }
+            self?.updateNavButtons()
+        }
+    }
+
+    private func fetchLastHeard() {
+        methodChannel?.invokeMethod("getLastHeard", arguments: nil) { [weak self] result in
+            guard let data = result as? [String: Any] else { return }
+            self?.lastHeardData = data
+            if self?.mapMode == .lastHeard {
+                self?.showLastHeardOnMap(data)
+            }
         }
     }
 
@@ -269,6 +434,19 @@ class CarPlayMapViewController: UIViewController, CPMapTemplateDelegate {
     private var mapView: MKMapView!
     private var stations: [[String: Any]] = []
     private var isSyncingFromPhone = false
+    private var qsoOverlayView: QsoOverlayView?
+
+    // Fly-to animation state
+    private var displayLink: CADisplayLink?
+    private var flyFromLat: Double = 0
+    private var flyFromLon: Double = 0
+    private var flyToLat: Double = 0
+    private var flyToLon: Double = 0
+    private var flyStartZoom: Double = 6
+    private var flyEndZoom: Double = 6
+    private var flyMinZoom: Double = 3
+    private var flyDuration: TimeInterval = 0.7
+    private var flyStartTime: TimeInterval = 0
 
     var onStationSelected: (([String: Any]) -> Void)?
     var onMapMoved: ((Double, Double, Double) -> Void)?  // lat, lon, zoom
@@ -281,11 +459,6 @@ class CarPlayMapViewController: UIViewController, CPMapTemplateDelegate {
         mapView.showsUserLocation = true
         mapView.delegate = self
 
-        // Use OpenStreetMap tiles to match the in-app map
-        let osmOverlay = MKTileOverlay(urlTemplate: "https://tile.openstreetmap.org/{z}/{x}/{y}.png")
-        osmOverlay.canReplaceMapContent = true
-        mapView.addOverlay(osmOverlay, level: .aboveLabels)
-
         // Default to a wide view of the US
         let center = CLLocationCoordinate2D(latitude: 39.8, longitude: -98.5)
         let region = MKCoordinateRegion(
@@ -297,7 +470,7 @@ class CarPlayMapViewController: UIViewController, CPMapTemplateDelegate {
         view.addSubview(mapView)
     }
 
-    func updateStations(_ newStations: [[String: Any]]) {
+    func updateStations(_ newStations: [[String: Any]], autoZoom: Bool = true) {
         self.stations = newStations
 
         // Remove old annotations
@@ -322,10 +495,30 @@ class CarPlayMapViewController: UIViewController, CPMapTemplateDelegate {
 
         mapView.addAnnotations(annotations)
 
-        // Zoom to fit all stations if we have any
-        if !annotations.isEmpty {
+        // Zoom to fit all stations if we have any (skip when flyTo will handle it)
+        if autoZoom && !annotations.isEmpty {
             mapView.showAnnotations(annotations, animated: true)
         }
+    }
+
+    func showQsoOverlay(lines: [String], isActive: Bool) {
+        if qsoOverlayView == nil {
+            let overlay = QsoOverlayView()
+            view.addSubview(overlay)
+            overlay.translatesAutoresizingMaskIntoConstraints = false
+            NSLayoutConstraint.activate([
+                overlay.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 12),
+                overlay.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -12),
+                overlay.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor, constant: -8),
+            ])
+            qsoOverlayView = overlay
+        }
+        qsoOverlayView?.update(lines: lines, isActive: isActive)
+        qsoOverlayView?.isHidden = false
+    }
+
+    func hideQsoOverlay() {
+        qsoOverlayView?.isHidden = true
     }
 
     func zoomIn() {
@@ -358,11 +551,105 @@ class CarPlayMapViewController: UIViewController, CPMapTemplateDelegate {
         mapView.setRegion(region, animated: true)
     }
 
+    /// Animated fly-to matching the phone's map_widget.dart behavior:
+    /// distance-based zoom arc that zooms out then back in.
+    func flyTo(lat: Double, lon: Double) {
+        let fromCenter = mapView.region.center
+        let fromLat = fromCenter.latitude
+        let fromLon = fromCenter.longitude
+
+        // Calculate distance in km (Haversine)
+        let distKm = haversineKm(lat1: fromLat, lon1: fromLon, lat2: lat, lon2: lon)
+
+        // Match the phone's distance thresholds
+        let minZoom: Double
+        let duration: TimeInterval
+        if distKm > 8000 {
+            minZoom = 2.5; duration = 2.8
+        } else if distKm > 4000 {
+            minZoom = 3.0; duration = 2.4
+        } else if distKm > 2000 {
+            minZoom = 3.5; duration = 2.0
+        } else if distKm > 800 {
+            minZoom = 4.0; duration = 1.5
+        } else if distKm > 200 {
+            minZoom = 4.5; duration = 1.0
+        } else if distKm > 10 {
+            minZoom = 5.5; duration = 0.7
+        } else {
+            // Very close — just pan without zoom arc
+            centerOn(lat: lat, lon: lon)
+            return
+        }
+
+        // Current zoom from span
+        let currentLonSpan = mapView.region.span.longitudeDelta
+        let currentZoom = log2(360.0 / max(currentLonSpan, 0.001))
+
+        flyFromLat = fromLat
+        flyFromLon = fromLon
+        flyToLat = lat
+        flyToLon = lon
+        flyStartZoom = currentZoom
+        flyEndZoom = 6.0
+        flyMinZoom = minZoom
+        flyDuration = duration
+        flyStartTime = CACurrentMediaTime()
+
+        displayLink?.invalidate()
+        let link = CADisplayLink(target: self, selector: #selector(flyAnimationTick))
+        link.add(to: .main, forMode: .default)
+        displayLink = link
+    }
+
+    @objc private func flyAnimationTick() {
+        let elapsed = CACurrentMediaTime() - flyStartTime
+        var t = elapsed / flyDuration
+        if t >= 1.0 {
+            t = 1.0
+            displayLink?.invalidate()
+            displayLink = nil
+        }
+
+        // Ease in-out
+        let eased = t < 0.5 ? 2 * t * t : 1 - pow(-2 * t + 2, 2) / 2
+
+        // Interpolate position
+        let lat = flyFromLat + (flyToLat - flyFromLat) * eased
+        let lon = flyFromLon + (flyToLon - flyFromLon) * eased
+
+        // Parabolic zoom arc: dips to flyMinZoom at t=0.5, recovers to flyEndZoom
+        let zoomDip = (flyStartZoom - flyMinZoom) * sin(.pi * t)
+        let zoom = flyStartZoom - zoomDip + (flyEndZoom - flyStartZoom) * t
+
+        // Convert zoom to span
+        let lonSpan = 360.0 / pow(2.0, zoom)
+        let latRadians = lat * .pi / 180.0
+        let latSpan = lonSpan * cos(latRadians)
+
+        isSyncingFromPhone = true
+        let coord = CLLocationCoordinate2D(latitude: lat, longitude: lon)
+        let region = MKCoordinateRegion(
+            center: coord,
+            span: MKCoordinateSpan(latitudeDelta: latSpan, longitudeDelta: lonSpan)
+        )
+        mapView.setRegion(region, animated: false)
+        isSyncingFromPhone = false
+    }
+
+    private func haversineKm(lat1: Double, lon1: Double, lat2: Double, lon2: Double) -> Double {
+        let r = 6371.0
+        let dLat = (lat2 - lat1) * .pi / 180
+        let dLon = (lon2 - lon1) * .pi / 180
+        let a = sin(dLat / 2) * sin(dLat / 2) +
+                cos(lat1 * .pi / 180) * cos(lat2 * .pi / 180) *
+                sin(dLon / 2) * sin(dLon / 2)
+        return r * 2 * atan2(sqrt(a), sqrt(1 - a))
+    }
+
     /// Sync map center/zoom from the phone app.
     func syncCenter(lat: Double, lon: Double, zoom: Double) {
         isSyncingFromPhone = true
-        // flutter_map zoom → MKMapView longitude span.
-        // Using same formula in both directions for round-trip stability.
         let lonSpan = 360.0 / pow(2.0, zoom)
         let latRadians = lat * .pi / 180.0
         let latSpan = lonSpan * cos(latRadians)
@@ -372,10 +659,62 @@ class CarPlayMapViewController: UIViewController, CPMapTemplateDelegate {
             center: coord,
             span: MKCoordinateSpan(latitudeDelta: latSpan, longitudeDelta: lonSpan)
         )
-        // No animation — ensures regionDidChangeAnimated fires immediately
-        // while isSyncingFromPhone is still true.
         mapView.setRegion(region, animated: false)
         isSyncingFromPhone = false
+    }
+}
+
+// MARK: - QSO Info Overlay
+
+class QsoOverlayView: UIView {
+    private let stackView = UIStackView()
+
+    override init(frame: CGRect) {
+        super.init(frame: frame)
+        backgroundColor = UIColor.black.withAlphaComponent(0.75)
+        layer.cornerRadius = 10
+        clipsToBounds = true
+
+        stackView.axis = .vertical
+        stackView.spacing = 2
+        stackView.alignment = .leading
+        stackView.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(stackView)
+
+        NSLayoutConstraint.activate([
+            stackView.topAnchor.constraint(equalTo: topAnchor, constant: 10),
+            stackView.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -10),
+            stackView.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 14),
+            stackView.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -14),
+        ])
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    func update(lines: [String], isActive: Bool) {
+        stackView.arrangedSubviews.forEach { $0.removeFromSuperview() }
+
+        for (index, line) in lines.enumerated() {
+            let label = UILabel()
+            label.text = line
+            label.textColor = .white
+            label.numberOfLines = 1
+
+            if index == 0 {
+                // First line: callsign + mode — large and bold
+                label.font = UIFont.boldSystemFont(ofSize: 18)
+                if isActive {
+                    label.textColor = UIColor.systemGreen
+                }
+            } else {
+                label.font = UIFont.systemFont(ofSize: 14)
+                label.textColor = UIColor.lightGray
+            }
+
+            stackView.addArrangedSubview(label)
+        }
     }
 }
 
@@ -411,16 +750,12 @@ extension CarPlayMapViewController: MKMapViewDelegate {
     func mapView(_ mapView: MKMapView, regionDidChangeAnimated animated: Bool) {
         guard !isSyncingFromPhone else { return }
         let center = mapView.region.center
-        // Reverse: lonSpan = 360 / 2^zoom  →  zoom = log2(360 / lonSpan)
         let lonSpan = mapView.region.span.longitudeDelta
         let zoom = log2(360.0 / max(lonSpan, 0.001))
         onMapMoved?(center.latitude, center.longitude, zoom)
     }
 
     func mapView(_ mapView: MKMapView, rendererFor overlay: MKOverlay) -> MKOverlayRenderer {
-        if let tileOverlay = overlay as? MKTileOverlay {
-            return MKTileOverlayRenderer(tileOverlay: tileOverlay)
-        }
         return MKOverlayRenderer(overlay: overlay)
     }
 }

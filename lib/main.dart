@@ -111,7 +111,7 @@ class _HomeScreenState extends State<HomeScreen> {
         appState: widget.appState,
         onLogQso: _logQsoFromSpot,
       ),
-      DeviceScreen(appState: widget.appState, onLogQso: _logQsoFromSpot),
+      DeviceScreen(appState: widget.appState, onLogQso: _logQsoFromSpot, carPlayChannel: _carPlayChannel),
       AprsScreen(appState: widget.appState, carPlayChannel: _carPlayChannel),
     ];
 

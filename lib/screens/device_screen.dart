@@ -3,6 +3,7 @@ import 'package:flutter/material.dart';
 import 'package:openrig_core/openrig_core.dart' hide ChangeNotifier;
 
 import '../connection_state.dart';
+import '../services/aprs_carplay_channel.dart';
 import '../services/native_discovery.dart';
 import '../widgets/map_widget.dart';
 import 'log_screen.dart' show QsoPreFill;
@@ -10,8 +11,9 @@ import 'log_screen.dart' show QsoPreFill;
 class DeviceScreen extends StatefulWidget {
   final AppConnectionState appState;
   final void Function(QsoPreFill preFill)? onLogQso;
+  final AprsCarPlayChannel? carPlayChannel;
 
-  const DeviceScreen({super.key, required this.appState, this.onLogQso});
+  const DeviceScreen({super.key, required this.appState, this.onLogQso, this.carPlayChannel});
 
   @override
   State<DeviceScreen> createState() => _DeviceScreenState();
@@ -77,6 +79,7 @@ class _DeviceScreenState extends State<DeviceScreen> {
   }
 
   void _disconnect() {
+    widget.carPlayChannel?.clearLastHeard();
     _disposeClient();
     widget.appState.disconnectDevice();
     if (mounted) setState(() {});
@@ -140,8 +143,9 @@ class _DeviceScreenState extends State<DeviceScreen> {
       _lastHeard.insert(0, entry);
       if (_lastHeard.length > 50) _lastHeard.removeLast();
     });
-    // Look up the new top callsign
+    // Look up the new top callsign and push to CarPlay
     if (_lastHeard.isNotEmpty) {
+      _pushLastHeardToCarPlay();
       _lookupCallsign(_lastHeard.first.callsign);
     }
   }
@@ -176,9 +180,12 @@ class _DeviceScreenState extends State<DeviceScreen> {
 
   void _showCallsignInfo(CallsignInfo info) {
     setState(() => _callsignInfo = info);
+    double? lat, lon;
     if (info.grid.length >= 4) {
       final ll = gridToLatLon(info.grid);
       if (ll != null) {
+        lat = ll.lat;
+        lon = ll.lon;
         _mapLocation.value = MapLocation(
           lat: ll.lat,
           lon: ll.lon,
@@ -186,6 +193,34 @@ class _DeviceScreenState extends State<DeviceScreen> {
         );
       }
     }
+    _pushLastHeardToCarPlay(lat: lat, lon: lon);
+  }
+
+  void _pushLastHeardToCarPlay({double? lat, double? lon}) {
+    final channel = widget.carPlayChannel;
+    if (channel == null || _lastHeard.isEmpty) return;
+    final entry = _lastHeard.first;
+    final info = _callsignInfo;
+    final freqMhz = _hotspot?.rfFrequencyMhz ?? 0.0;
+    final locationParts = <String>[];
+    if (info != null) {
+      if (info.city.isNotEmpty) locationParts.add(info.city);
+      if (info.state.isNotEmpty) locationParts.add(info.state);
+      if (info.country.isNotEmpty) locationParts.add(info.country);
+    }
+    channel.updateLastHeard(
+      callsign: entry.callsign,
+      mode: entry.mode.toUpperCase(),
+      info: entry.info,
+      duration: entry.duration,
+      isActive: entry.isActive,
+      name: info?.fullName,
+      location: locationParts.join(', '),
+      grid: info?.grid,
+      lat: lat,
+      lon: lon,
+      freqMhz: freqMhz,
+    );
   }
 
   String _formatUptime(int seconds) {
