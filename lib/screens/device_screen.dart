@@ -179,6 +179,8 @@ class _DeviceScreenState extends State<DeviceScreen> {
   }
 
   void _showCallsignInfo(CallsignInfo info) {
+    // Ignore stale lookups — only update for the most recently requested callsign.
+    if (info.call != _lastLookedUp) return;
     setState(() => _callsignInfo = info);
     double? lat, lon;
     if (info.grid.length >= 4) {
