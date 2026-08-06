@@ -242,7 +242,10 @@ class _DeviceScreenState extends State<DeviceScreen> {
     final services = <String>[];
     if (type == 'hotspot') {
       if (hotspot?.dmr.enabled == true) services.add('dmr');
-      if (hotspot?.ysf.enabled == true) services.add('ysf');
+      if (hotspot?.ysf.enabled == true) {
+        services.add('ysf');
+        services.add('ysfparrot');
+      }
       if (hotspot?.ysf2dmr.enabled == true) services.add('ysf2dmr');
       if (hotspot?.dmr2ysf.enabled == true) services.add('dmr2ysf');
     }
